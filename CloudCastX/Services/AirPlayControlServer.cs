@@ -18,10 +18,13 @@ namespace CloudCast.Services
         private StreamSocketListener? _listener;
         private MirroringSession? _activeSession;
         private DatagramSocket? _audioSocket;
+        private DatagramSocket? _timingSocket;
 
         private byte[]? _encryptedAesKey;
         private byte[]? _aesIv;
         private string? _streamConnectionId;
+        private ushort _clientTimingPort;
+        private string? _clientAddress;
 
         public event Action<string>? StatusChanged;
         public event Action<string>? StreamingStarted;
@@ -54,6 +57,9 @@ namespace CloudCast.Services
             try
             {
                 using var socket = args.Socket;
+                _clientAddress = socket.Information.RemoteAddress.DisplayName;
+                System.Diagnostics.Debug.WriteLine($"[AirPlay] Connection from {_clientAddress}");
+
                 while (true)
                 {
                     var req = await ReadRequestAsync(socket);
@@ -66,8 +72,12 @@ namespace CloudCast.Services
                         conn.Equals("close", StringComparison.OrdinalIgnoreCase))
                         break;
                 }
+                System.Diagnostics.Debug.WriteLine("[AirPlay] Connection closed");
             }
-            catch { /* client disconnected */ }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[AirPlay] Connection error: {ex.Message}");
+            }
         }
 
         private static async Task<HttpReq?> ReadRequestAsync(StreamSocket socket)
@@ -83,7 +93,11 @@ namespace CloudCast.Services
             while (true)
             {
                 uint loaded = await reader.LoadAsync(1);
-                if (loaded == 0) return null;
+                if (loaded == 0)
+                {
+                    System.Diagnostics.Debug.WriteLine("[AirPlay] Peer closed connection");
+                    return null;
+                }
 
                 byte b = reader.ReadByte();
                 lineBytes.Add(b);
@@ -251,7 +265,13 @@ namespace CloudCast.Services
         {
             var plist = BinaryPlist.Decode(body);
             if (plist == null)
+            {
+                System.Diagnostics.Debug.WriteLine("[AirPlay] SETUP: failed to decode plist");
                 return HttpResp.Ok(Array.Empty<byte>());
+            }
+
+            System.Diagnostics.Debug.WriteLine(
+                $"[AirPlay] SETUP plist keys: {string.Join(", ", plist.Keys)}");
 
             // Extract crypto keys whenever present (may arrive in initial or stream SETUP)
             if (plist.TryGetValue("ekey", out var ekeyObj) && ekeyObj is byte[] ekey)
@@ -269,18 +289,23 @@ namespace CloudCast.Services
                 _streamConnectionId = scid.ToString();
                 System.Diagnostics.Debug.WriteLine($"[AirPlay] SETUP: streamConnectionID={_streamConnectionId}");
             }
+            if (plist.TryGetValue("timingPort", out var tpObj))
+            {
+                _clientTimingPort = (ushort)Convert.ToInt64(tpObj);
+                System.Diagnostics.Debug.WriteLine($"[AirPlay] SETUP: client timingPort={_clientTimingPort}");
+            }
 
             // Branch: initial SETUP (no streams) vs stream SETUP (has streams)
             if (plist.ContainsKey("streams"))
                 return await HandleStreamSetupAsync(plist);
             else
-                return HandleInitialSetup();
+                return await HandleInitialSetupAsync();
         }
 
         // Phase 1: Initial SETUP — store ekey/eiv, return timing/event ports.
         // Both point to ControlPort (7000) so iOS timing/event traffic arrives
         // on the existing TCP listener (unrecognized requests return 200 OK).
-        private HttpResp HandleInitialSetup()
+        private async Task<HttpResp> HandleInitialSetupAsync()
         {
             System.Diagnostics.Debug.WriteLine(
                 $"[AirPlay] SETUP initial: timingPort={AirPlayConfig.ControlPort}, " +
@@ -291,6 +316,10 @@ namespace CloudCast.Services
                 ["timingPort"] = (long)AirPlayConfig.ControlPort,
                 ["eventPort"]  = (long)AirPlayConfig.ControlPort,
             };
+
+            // Start NTP timing — iOS waits for timing sync before sending the stream SETUP
+            _ = StartNtpTimingAsync();
+
             return HttpResp.Ok(BinaryPlist.Encode(responseDict), "application/x-apple-binary-plist");
         }
 
@@ -426,8 +455,115 @@ namespace CloudCast.Services
             }
             _audioSocket?.Dispose();
             _audioSocket = null;
+            _timingSocket?.Dispose();
+            _timingSocket = null;
             StreamingStopped?.Invoke();
             return HttpResp.Ok(Array.Empty<byte>());
+        }
+
+        // ── NTP timing ───────────────────────────────────────────────────────
+        // After the initial SETUP, the receiver must initiate NTP timing to
+        // the client's timingPort. iOS waits for timing sync before proceeding
+        // to the stream SETUP.
+
+        private async Task StartNtpTimingAsync()
+        {
+            if (_clientTimingPort == 0 || string.IsNullOrEmpty(_clientAddress))
+            {
+                System.Diagnostics.Debug.WriteLine("[NTP] No client timing info — skipping");
+                return;
+            }
+
+            try
+            {
+                _timingSocket?.Dispose();
+                _timingSocket = new DatagramSocket();
+                _timingSocket.MessageReceived += OnTimingMessage;
+                await _timingSocket.BindServiceNameAsync("0");
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"[NTP] Starting timing to {_clientAddress}:{_clientTimingPort}");
+
+                // Send a burst of 3 initial packets, then continue periodically
+                for (int i = 0; i < 3; i++)
+                {
+                    await SendNtpPacketAsync();
+                    await Task.Delay(200);
+                }
+
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        for (int i = 0; i < 50; i++)
+                        {
+                            await Task.Delay(500);
+                            await SendNtpPacketAsync();
+                        }
+                    }
+                    catch { /* timing stopped */ }
+                });
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[NTP] Failed to start: {ex.Message}");
+            }
+        }
+
+        private async Task SendNtpPacketAsync()
+        {
+            if (_timingSocket == null || _clientAddress == null || _clientTimingPort == 0)
+                return;
+
+            try
+            {
+                var outputStream = await _timingSocket.GetOutputStreamAsync(
+                    new Windows.Networking.HostName(_clientAddress),
+                    _clientTimingPort.ToString());
+                using var writer = new DataWriter(outputStream);
+
+                // 32-byte NTP timing request
+                // [0-1] RTP header: V=2, PT=0xD2  [2-3] seq  [4-23] zeros
+                // [24-31] NTP transmit timestamp (seconds.fraction since 1900)
+                var packet = new byte[32];
+                packet[0] = 0x80;
+                packet[1] = 0xd2;
+                packet[2] = 0x00;
+                packet[3] = 0x07;
+
+                long unixSec = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                long ntpSec  = unixSec + 2208988800L; // NTP epoch offset
+                long frac    = (long)((DateTimeOffset.UtcNow.Millisecond / 1000.0) * 0x100000000L);
+
+                packet[24] = (byte)(ntpSec >> 24);
+                packet[25] = (byte)(ntpSec >> 16);
+                packet[26] = (byte)(ntpSec >> 8);
+                packet[27] = (byte)ntpSec;
+                packet[28] = (byte)(frac >> 24);
+                packet[29] = (byte)(frac >> 16);
+                packet[30] = (byte)(frac >> 8);
+                packet[31] = (byte)frac;
+
+                writer.WriteBytes(packet);
+                await writer.StoreAsync();
+
+                System.Diagnostics.Debug.WriteLine("[NTP] Timing packet sent");
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[NTP] Send failed: {ex.Message}");
+            }
+        }
+
+        private void OnTimingMessage(DatagramSocket sender, DatagramSocketMessageReceivedEventArgs e)
+        {
+            try
+            {
+                using var reader = e.GetDataReader();
+                uint len = reader.UnconsumedBufferLength;
+                System.Diagnostics.Debug.WriteLine($"[NTP] Received {len}-byte timing response");
+            }
+            catch { }
         }
     }
 

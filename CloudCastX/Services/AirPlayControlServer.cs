@@ -378,35 +378,23 @@ namespace CloudCast.Services
                 return await HandleInitialSetupAsync();
         }
 
-        // Phase 1: Initial SETUP — create event/timing sockets and return their real ports.
-        // Spec says: initial SETUP response must include eventPort and timingPort.
+        // Phase 1: Initial SETUP — store ekey/eiv, bind sockets, return empty 200 OK.
+        // Samsung TV wire capture shows Content-Length: 0 for the initial SETUP.
+        // eventPort/timingPort go in the stream SETUP response.
+        // Returning a plist here causes iOS to reject immediately (faster failure).
         private async Task<HttpResp> HandleInitialSetupAsync()
         {
-            // Create event and timing UDP sockets BEFORE responding,
-            // so we can return real ports that iOS can reach.
             await EnsureEventSocketAsync();
             await EnsureTimingSocketAsync();
-
-            ushort timingPort = GetTimingPort();
             _sessionActive = true;
 
             System.Diagnostics.Debug.WriteLine(
-                $"[AirPlay] SETUP initial: eventPort={_eventPort} timingPort={timingPort}");
+                $"[AirPlay] SETUP initial: empty 200 OK (session active, event={_eventPort} timing={GetTimingPort()})");
 
-            // Start NTP timing after a brief delay so SETUP response arrives first
-            _ = Task.Run(async () =>
-            {
-                await Task.Delay(100);
-                await StartNtpTimingAsync();
-            });
+            // Start NTP timing immediately (fire-and-forget)
+            _ = StartNtpTimingAsync();
 
-            // Spec text says initial SETUP response includes eventPort and timingPort
-            var responseDict = new Dictionary<string, object>
-            {
-                ["eventPort"]  = (long)_eventPort,
-                ["timingPort"] = (long)timingPort,
-            };
-            return HttpResp.Ok(BinaryPlist.Encode(responseDict), "application/x-apple-binary-plist");
+            return HttpResp.Ok(Array.Empty<byte>());
         }
 
         // Phase 2: Stream SETUP — parse the streams array, bind ports, echo type back.

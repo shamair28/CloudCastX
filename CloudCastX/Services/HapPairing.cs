@@ -14,27 +14,19 @@ using Org.BouncyCastle.Crypto;
 namespace CloudCast.Services
 {
     // Implements Apple HomeKit Accessory Protocol (HAP) pairing:
-    //   pair-setup  → M1→M2 (Ed25519 key exchange)
-    //   pair-verify → M1→M2 (ECDH shared secret + Ed25519 signature verification)
-    //
-    // TLV8 tag constants (HAP spec §4):
-    //   0x00 = Method    0x01 = Identifier  0x02 = Salt      0x03 = PublicKey
-    //   0x04 = Proof     0x05 = EncData     0x06 = State     0x07 = Error
-    //   0x09 = Signature 0x0A = Permissions 0x0D = SessionID
+    //   pair-setup  → M1(state=1)→M2 (Ed25519 key exchange)
+    //   pair-verify → M1(state=1)→M2, M3(state=3)→M4 (ECDH + Ed25519 verify)
     internal class HapPairing
     {
         private readonly AirPlayConfig _config;
 
-        // ECDH key pair generated once per server lifetime
         private readonly byte[] _ecdhPrivateKey;
         private readonly byte[] _ecdhPublicKey;
 
-        // Ephemeral keys generated per verify session
         private byte[]? _verifyPrivateKey;
         private byte[]? _verifyPublicKey;
         private byte[]? _peerPublicKey;
 
-        // Exposed for MirroringSession stream key derivation
         public byte[]? EcdhSharedSecret { get; private set; }
 
         public HapPairing(AirPlayConfig config)
@@ -50,22 +42,33 @@ namespace CloudCast.Services
         }
 
         // ── pair-setup ────────────────────────────────────────────────────────
-        // iOS sends M1 (state=1, method=0). We respond with M2: Ed25519 public key.
+        // iOS sends M1 (state=1). We respond with M2: our Ed25519 public key.
+        // Any other state is unexpected here — return null so the caller sends 470.
         public Task<byte[]?> HandlePairSetupAsync(byte[] body)
         {
             var tlv = DecodeTlv8(body);
             tlv.TryGetValue(0x06, out var stateBytes);
             byte state = (stateBytes != null && stateBytes.Length > 0) ? stateBytes[0] : (byte)0;
-            System.Diagnostics.Debug.WriteLine($"[HAP] pair-setup state={state}");
+            System.Diagnostics.Debug.WriteLine($"[HAP] pair-setup received state={state}");
+
+            // Only respond to M1 (state=1). Any other state is a protocol error.
+            if (state != 1)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"[HAP] pair-setup: unexpected state {state}, expected 1 (M1) — rejecting");
+                return Task.FromResult<byte[]?>(null);
+            }
 
             var response = EncodeTlv8(new Dictionary<byte, byte[]>
             {
                 { 0x06, new byte[] { 0x02 } },      // state = M2
-                { 0x03, _config.Ed25519PublicKey },  // public key
+                { 0x03, _config.Ed25519PublicKey },  // raw 32-byte Ed25519 public key
             });
+
             System.Diagnostics.Debug.WriteLine(
                 $"[HAP] pair-setup M2: {response.Length} bytes, " +
                 $"pk={BitConverter.ToString(_config.Ed25519PublicKey, 0, 4)}…");
+
             return Task.FromResult<byte[]?>(response);
         }
 
@@ -75,7 +78,7 @@ namespace CloudCast.Services
             var tlv = DecodeTlv8(body);
             tlv.TryGetValue(0x06, out var stateBytes);
             byte state = (stateBytes != null && stateBytes.Length > 0) ? stateBytes[0] : (byte)0;
-            System.Diagnostics.Debug.WriteLine($"[HAP] pair-verify state={state}");
+            System.Diagnostics.Debug.WriteLine($"[HAP] pair-verify received state={state}");
 
             if (state == 1)
                 return Task.FromResult(HandleVerifyPhase1(tlv));
@@ -96,7 +99,6 @@ namespace CloudCast.Services
                 return null;
             }
 
-            // Generate ephemeral X25519 key pair for this verify session
             var gen = new X25519KeyPairGenerator();
             gen.Init(new X25519KeyGenerationParameters(new SecureRandom()));
             var kp = gen.GenerateKeyPair();
@@ -105,7 +107,6 @@ namespace CloudCast.Services
             ((X25519PrivateKeyParameters)kp.Private).Encode(_verifyPrivateKey, 0);
             ((X25519PublicKeyParameters)kp.Public).Encode(_verifyPublicKey, 0);
 
-            // ECDH: our ephemeral private + peer public → shared secret
             var agreement = new X25519Agreement();
             agreement.Init(new X25519PrivateKeyParameters(_verifyPrivateKey, 0));
             EcdhSharedSecret = new byte[agreement.AgreementSize];
@@ -115,15 +116,14 @@ namespace CloudCast.Services
             System.Diagnostics.Debug.WriteLine(
                 $"[HAP] pair-verify phase 1: ECDH shared={BitConverter.ToString(EcdhSharedSecret, 0, 4)}…");
 
-            // Sign: Ed25519( ourVerifyPublicKey || peerPublicKey )
             var msgToSign = Concat(_verifyPublicKey, _peerPublicKey);
             var signature = Ed25519Sign(msgToSign, _config.Ed25519PrivateKey);
 
             var response = EncodeTlv8(new Dictionary<byte, byte[]>
             {
-                { 0x06, new byte[] { 0x02 } }, // state = M2
-                { 0x03, _verifyPublicKey },     // our ephemeral verify public key
-                { 0x09, signature },            // Ed25519 signature
+                { 0x06, new byte[] { 0x02 } },
+                { 0x03, _verifyPublicKey },
+                { 0x09, signature },
             });
             System.Diagnostics.Debug.WriteLine(
                 $"[HAP] pair-verify phase 1 M2: {response.Length} bytes");
@@ -146,7 +146,6 @@ namespace CloudCast.Services
                 return null;
             }
 
-            // Derive session key via HKDF-SHA-512
             byte[] sessionKey = HkdfSha512(
                 EcdhSharedSecret,
                 Encoding.UTF8.GetBytes("Pair-Verify-Encrypt-Salt"),
@@ -156,29 +155,28 @@ namespace CloudCast.Services
             System.Diagnostics.Debug.WriteLine(
                 $"[HAP] pair-verify phase 2: sessionKey={BitConverter.ToString(sessionKey, 0, 4)}…");
 
-            // Decrypt using ChaCha20-Poly1305, nonce="PV-Msg03"
             byte[]? plaintext = ChaCha20Poly1305Decrypt(
                 sessionKey, Encoding.UTF8.GetBytes("PV-Msg03"), encData);
 
             if (plaintext == null)
             {
                 System.Diagnostics.Debug.WriteLine(
-                    "[HAP] pair-verify phase 2: ChaCha20-Poly1305 decryption failed");
+                    "[HAP] pair-verify phase 2: ChaCha20-Poly1305 decryption FAILED");
                 return null;
             }
 
             System.Diagnostics.Debug.WriteLine(
-                $"[HAP] pair-verify phase 2: decrypted {plaintext.Length} bytes");
+                $"[HAP] pair-verify phase 2: decrypted {plaintext.Length} bytes OK");
 
             var inner = DecodeTlv8(plaintext);
             inner.TryGetValue(0x01, out var peerId);
             System.Diagnostics.Debug.WriteLine(
-                $"[HAP] pair-verify phase 2: peerId={( peerId != null ? Encoding.UTF8.GetString(peerId) : "null")}");
+                $"[HAP] pair-verify phase 2: peerId=" +
+                (peerId != null ? Encoding.UTF8.GetString(peerId) : "null"));
 
-            // Respond M4 — pairing complete
             var response = EncodeTlv8(new Dictionary<byte, byte[]>
             {
-                { 0x06, new byte[] { 0x04 } }, // state = M4
+                { 0x06, new byte[] { 0x04 } }, // state = M4 — pairing complete
             });
             System.Diagnostics.Debug.WriteLine(
                 $"[HAP] pair-verify M4: {response.Length} bytes — pairing COMPLETE");
@@ -200,7 +198,7 @@ namespace CloudCast.Services
         {
             try
             {
-                // HAP uses an 8-byte nonce, zero-padded to 12 bytes on the left
+                // HAP uses an 8-byte nonce left-padded to 12 bytes
                 var nonce12 = new byte[12];
                 Array.Copy(nonce, 0, nonce12, 4, Math.Min(nonce.Length, 8));
 
@@ -255,7 +253,7 @@ namespace CloudCast.Services
                 {
                     int chunkLen = Math.Min(value.Length - offset, 255);
                     result.Add(tag);
-                    result.Add((byte)chunkLen);  // explicit cast: int → byte
+                    result.Add((byte)chunkLen);
                     result.AddRange(new ArraySegment<byte>(value, offset, chunkLen));
                     offset += chunkLen;
                 } while (offset < value.Length);

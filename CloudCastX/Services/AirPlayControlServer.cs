@@ -51,7 +51,7 @@ namespace CloudCast.Services
             return Task.CompletedTask;
         }
 
-        // ── Connection handling ────────────────────────────────────────────────
+        // ── Connection handling ──────────────────────────────────────────────
 
         private async void OnConnectionReceived(StreamSocketListener sender,
             StreamSocketListenerConnectionReceivedEventArgs args)
@@ -77,7 +77,7 @@ namespace CloudCast.Services
             catch { /* client disconnected */ }
         }
 
-        // ── Request reader ────────────────────────────────────────────────────
+        // ── Request reader ────────────────────────────────────────────────
 
         private static async Task<HttpReq?> ReadRequestAsync(StreamSocket socket)
         {
@@ -138,7 +138,7 @@ namespace CloudCast.Services
             return new HttpReq(method, path, headers, body);
         }
 
-        // ── Response writer ───────────────────────────────────────────────────
+        // ── Response writer ────────────────────────────────────────────────
 
         private static async Task SendResponseAsync(StreamSocket socket, HttpResp resp)
         {
@@ -163,7 +163,7 @@ namespace CloudCast.Services
             writer.DetachStream();
         }
 
-        // ── Request dispatcher ────────────────────────────────────────────────
+        // ── Request dispatcher ──────────────────────────────────────────────
 
         private async Task<HttpResp> HandleRequestAsync(HttpReq req)
         {
@@ -190,15 +190,16 @@ namespace CloudCast.Services
             }
         }
 
-        // ── Endpoint handlers ─────────────────────────────────────────────────
+        // ── Endpoint handlers ───────────────────────────────────────────────
 
         private HttpResp HandleInfo()
         {
-            // Build binary plist with device capabilities. The apple device reads this
-            // to decide which pairing and streaming paths to attempt.
-            // pk must be the hex string of the Ed25519 public key (not raw bytes).
-            string pkHex = BitConverter.ToString(_config.Ed25519PublicKey)
-                               .Replace("-", "").ToLowerInvariant();
+            // Build binary plist with device capabilities.
+            //
+            // CRITICAL: pk MUST be sent as a raw byte[] (binary plist type 0x4x DATA),
+            // NOT as a hex string (type 0x5x ASCII). iOS compares the raw public key
+            // bytes it receives in pair-setup M2 against the pk field from /info.
+            // If the types differ, iOS silently drops the connection after M2.
             var dict = new Dictionary<string, object>
             {
                 ["deviceID"]                = _config.DeviceId,
@@ -209,14 +210,19 @@ namespace CloudCast.Services
                 ["model"]                   = AirPlayConfig.Model,
                 ["name"]                    = _config.DeviceName,
                 ["pi"]                      = _config.PairingId,
-                ["pk"]                      = pkHex,
+                // Raw bytes — BinaryPlist.Encode writes this as type 0x4x (data), which
+                // is what iOS expects. A hex string would be type 0x5x and would fail.
+                ["pk"]                      = _config.Ed25519PublicKey,
                 ["psi"]                     = "00000000-0000-0000-0000-000000000000",
                 ["srcvers"]                 = AirPlayConfig.ServerVersion,
                 // statusFlags=0: no PIN required for transient pairing.
-                // 0x04 was incorrectly forcing iOS to show a PIN entry dialog.
                 ["statusFlags"]             = (long)0,
                 ["vv"]                      = (long)2,
             };
+
+            System.Diagnostics.Debug.WriteLine(
+                $"[AirPlay] /info: pk as raw bytes ({_config.Ed25519PublicKey.Length}B), " +
+                $"features=0x{AirPlayConfig.Features:X}");
 
             byte[] plist = BinaryPlist.Encode(dict);
             return HttpResp.Ok(plist, "application/x-apple-binary-plist");
@@ -246,12 +252,6 @@ namespace CloudCast.Services
                 : HttpResp.Error(403);
         }
 
-        // Bug 7 & 8 fix: HandleSetupOrDefaultAsync is now async.
-        // On the first SETUP request, a MirroringSession is created and its UDP
-        // socket is bound immediately (BindUdpAsync). The real OS-assigned port
-        // is then returned to iOS in the dataPort field — previously a hardcoded
-        // constant was returned while the actual socket was bound later during
-        // /stream, so iOS was always sending video to the wrong port.
         private async Task<HttpResp> HandleSetupOrDefaultAsync(HttpReq req)
         {
             if (req.Body.Length == 0)
@@ -290,8 +290,6 @@ namespace CloudCast.Services
                 System.Diagnostics.Debug.WriteLine($"[AirPlay] SETUP streamConnectionID: {_streamConnectionId}");
             }
 
-            // Bug 7 & 8 fix: bind the UDP socket now so we know the real port.
-            // Stop any pre-existing session before creating a new one.
             _activeSession?.Stop();
             _activeSession = new MirroringSession(_player);
             await _activeSession.BindUdpAsync();
@@ -308,7 +306,6 @@ namespace CloudCast.Services
                     new Dictionary<string, object>
                     {
                         ["type"]     = (long)110,
-                        // Return the actual bound port, not a hardcoded constant.
                         ["dataPort"] = (long)_activeSession.VideoPort,
                     }
                 }
@@ -318,7 +315,6 @@ namespace CloudCast.Services
 
         private async Task<HttpResp> HandleStreamAsync(HttpReq req)
         {
-            // Parse the request plist — may contain streams array and/or ekey/eiv.
             Dictionary<string, object>? plist = null;
             if (req.Body.Length > 0)
             {
@@ -326,7 +322,6 @@ namespace CloudCast.Services
                 catch { /* not a valid plist */ }
             }
 
-            // Extract ekey/eiv if present in this request (some iOS versions bundle it here)
             if (plist != null)
             {
                 if (plist.TryGetValue("ekey", out var ekeyObj) && ekeyObj is byte[] ekey)
@@ -337,8 +332,6 @@ namespace CloudCast.Services
                     _streamConnectionId = scid?.ToString();
             }
 
-            // Guard against null KeyMsg — FairPlay phase 2 must have completed
-            // before a mirroring session can decrypt the video stream.
             if (_fp.KeyMsg == null)
             {
                 System.Diagnostics.Debug.WriteLine(
@@ -347,8 +340,6 @@ namespace CloudCast.Services
                 return HttpResp.Error(403);
             }
 
-            // If SETUP already created and bound the session, reuse it.
-            // Otherwise create a new one (fallback for clients that skip SETUP).
             if (_activeSession == null)
             {
                 _activeSession = new MirroringSession(_player);
@@ -361,7 +352,6 @@ namespace CloudCast.Services
 
             StatusChanged?.Invoke("Connecting…");
 
-            // Return the same port that was already communicated in SETUP.
             var responseDict = new Dictionary<string, object>
             {
                 ["streams"] = new object[]
@@ -406,7 +396,7 @@ namespace CloudCast.Services
         }
     }
 
-    // ── Lightweight HTTP message types ────────────────────────────────────────
+    // ── Lightweight HTTP message types ─────────────────────────────────────────────
 
     internal class HttpReq
     {

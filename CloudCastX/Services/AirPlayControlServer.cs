@@ -60,7 +60,7 @@ namespace CloudCast.Services
                     if (req == null) break;
 
                     var resp = await HandleRequestAsync(req);
-                    await SendResponseAsync(socket, resp);
+                    await SendResponseAsync(socket, resp, req);
 
                     if (req.Headers.TryGetValue("Connection", out var conn) &&
                         conn.Equals("close", StringComparison.OrdinalIgnoreCase))
@@ -102,8 +102,9 @@ namespace CloudCast.Services
 
             var parts = lines[0].Split(' ');
             if (parts.Length < 2) return null;
-            string method = parts[0];
-            string path   = parts[1].Split('?')[0];
+            string method   = parts[0];
+            string path     = parts[1].Split('?')[0];
+            string protocol = parts.Length >= 3 ? parts[2] : "HTTP/1.1";
 
             var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             for (int i = 1; i < lines.Count; i++)
@@ -122,16 +123,20 @@ namespace CloudCast.Services
                 reader.ReadBytes(body);
             }
 
-            return new HttpReq(method, path, headers, body);
+            return new HttpReq(method, path, protocol, headers, body);
         }
 
-        private static async Task SendResponseAsync(StreamSocket socket, HttpResp resp)
+        private static async Task SendResponseAsync(StreamSocket socket, HttpResp resp, HttpReq req)
         {
             using var writer = new DataWriter(socket.OutputStream);
 
             var sb = new StringBuilder();
-            sb.Append($"HTTP/1.1 {resp.StatusCode} {resp.StatusText}\r\n");
+            // Mirror the client's protocol (RTSP/1.0 or HTTP/1.1)
+            sb.Append($"{req.Protocol} {resp.StatusCode} {resp.StatusText}\r\n");
             sb.Append($"Server: AirTunes/{AirPlayConfig.ServerVersion}\r\n");
+            // Echo CSeq — mandatory in RTSP, harmless in HTTP
+            if (req.Headers.TryGetValue("CSeq", out var cseq))
+                sb.Append($"CSeq: {cseq}\r\n");
             sb.Append($"Content-Length: {resp.Body.Length}\r\n");
             if (!string.IsNullOrEmpty(resp.ContentType))
                 sb.Append($"Content-Type: {resp.ContentType}\r\n");
@@ -428,13 +433,14 @@ namespace CloudCast.Services
 
     internal class HttpReq
     {
-        public string Method  { get; }
-        public string Path    { get; }
+        public string Method   { get; }
+        public string Path     { get; }
+        public string Protocol { get; } // "RTSP/1.0" or "HTTP/1.1"
         public Dictionary<string, string> Headers { get; }
-        public byte[] Body    { get; }
-        public HttpReq(string method, string path,
+        public byte[] Body     { get; }
+        public HttpReq(string method, string path, string protocol,
             Dictionary<string, string> headers, byte[] body)
-        { Method = method; Path = path; Headers = headers; Body = body; }
+        { Method = method; Path = path; Protocol = protocol; Headers = headers; Body = body; }
     }
 
     internal class HttpResp

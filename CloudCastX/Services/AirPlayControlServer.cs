@@ -360,19 +360,30 @@ namespace CloudCast.Services
                 return await HandleInitialSetupAsync();
         }
 
-        // Phase 1: Initial SETUP — store ekey/eiv, return timing/event ports.
-        // Both point to ControlPort (7000) so iOS timing/event traffic arrives
-        // on the existing TCP listener (unrecognized requests return 200 OK).
+        // Phase 1: Initial SETUP — create event/timing sockets and return their real ports.
+        // Spec says: initial SETUP response must include eventPort and timingPort.
         private async Task<HttpResp> HandleInitialSetupAsync()
         {
-            // Wire capture shows the initial SETUP response is Content-Length: 0.
-            // eventPort/timingPort go in the stream SETUP response (CSeq:10), not here.
-            System.Diagnostics.Debug.WriteLine("[AirPlay] SETUP initial: returning empty 200 OK");
+            // Create event and timing UDP sockets BEFORE responding,
+            // so we can return real ports that iOS can reach.
+            await EnsureEventSocketAsync();
+            await EnsureTimingSocketAsync();
 
-            // Start NTP timing — iOS waits for timing sync before sending the stream SETUP
+            ushort timingPort = GetTimingPort();
+
+            System.Diagnostics.Debug.WriteLine(
+                $"[AirPlay] SETUP initial: eventPort={_eventPort} timingPort={timingPort}");
+
+            // Start NTP timing to the client (uses the already-bound _timingSocket)
             _ = StartNtpTimingAsync();
 
-            return HttpResp.Ok(Array.Empty<byte>());
+            // Spec says: initial SETUP response must include eventPort and timingPort
+            var responseDict = new Dictionary<string, object>
+            {
+                ["eventPort"]  = (long)_eventPort,
+                ["timingPort"] = (long)timingPort,
+            };
+            return HttpResp.Ok(BinaryPlist.Encode(responseDict), "application/x-apple-binary-plist");
         }
 
         // Phase 2: Stream SETUP — parse the streams array, bind ports, echo type back.
@@ -542,6 +553,16 @@ namespace CloudCast.Services
             System.Diagnostics.Debug.WriteLine($"[AirPlay] Event socket bound on port {_eventPort}");
         }
 
+        private async Task EnsureTimingSocketAsync()
+        {
+            if (_timingSocket != null) return;
+            _timingSocket = new DatagramSocket();
+            _timingSocket.MessageReceived += OnTimingMessage;
+            await _timingSocket.BindServiceNameAsync("0");
+            System.Diagnostics.Debug.WriteLine(
+                $"[AirPlay] Timing socket bound on port {_timingSocket.Information.LocalPort}");
+        }
+
         private ushort GetTimingPort()
         {
             if (_timingSocket != null)
@@ -567,10 +588,7 @@ namespace CloudCast.Services
 
             try
             {
-                _timingSocket?.Dispose();
-                _timingSocket = new DatagramSocket();
-                _timingSocket.MessageReceived += OnTimingMessage;
-                await _timingSocket.BindServiceNameAsync("0");
+                await EnsureTimingSocketAsync(); // reuse if already created
 
                 System.Diagnostics.Debug.WriteLine(
                     $"[NTP] Starting timing to {_clientAddress}:{_clientTimingPort}");

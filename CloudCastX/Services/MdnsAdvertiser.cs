@@ -1,97 +1,101 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
+using System.Text;
 using System.Threading.Tasks;
-using Makaretu.Dns;
+using Windows.Networking.ServiceDiscovery.Dnssd;
+using Windows.Networking.Sockets;
 
 namespace CloudCast.Services
 {
-    // Advertises two mDNS/DNS-SD services so Apple devices can find CloudCast in the
-    // AirPlay picker without any manual configuration:
-    //   _airplay._tcp  — primary AirPlay 2 discovery service
-    //   _raop._tcp     — legacy Remote Audio Output Protocol discovery
-    //
-    // Uses Makaretu.Dns.Multicast (UdpClient-based, works on both PC and Xbox with the
-    // privateNetworkClientServer capability declared in Package.appxmanifest).
+    // Advertises the AirPlay receiver over mDNS/DNS-SD so iOS can discover it.
+    // Registers two service types as Apple's AirPlay 2 stack requires:
+    //   _airplay._tcp  — carries capabilities + pairing key
+    //   _raop._tcp     — legacy audio path (needed for iOS to show the device in
+    //                    the AirPlay picker even for video-only receivers)
     internal class MdnsAdvertiser
     {
-        private readonly AirPlayConfig _config;
-        private MulticastService? _mdns;
-        private ServiceDiscovery? _sd;
-        private ServiceProfile? _airplayProfile;
-        private ServiceProfile? _raopProfile;
+        private DnssdServiceInstance? _airplayInstance;
+        private DnssdServiceInstance? _raopInstance;
+        private DnssdRegistrationResult? _airplayReg;
+        private DnssdRegistrationResult? _raopReg;
 
-        public MdnsAdvertiser(AirPlayConfig config) => _config = config;
-
-        public Task StartAsync()
+        public async Task StartAsync(AirPlayConfig config)
         {
-            _mdns = new MulticastService();
-            _sd   = new ServiceDiscovery(_mdns);
+            System.Diagnostics.Debug.WriteLine(
+                $"[mDNS] Registering '{config.DeviceName}' on port {AirPlayConfig.ControlPort}");
 
-            _airplayProfile = BuildAirPlayProfile();
-            _raopProfile    = BuildRaopProfile();
+            string pkHex = BitConverter.ToString(config.Ed25519PublicKey)
+                               .Replace("-", "").ToLowerInvariant();
 
-            _sd.Advertise(_airplayProfile);
-            _sd.Advertise(_raopProfile);
+            // ── _airplay._tcp ─────────────────────────────────────────────────
+            _airplayInstance = new DnssdServiceInstance(
+                $"{config.DeviceName}._airplay._tcp.local",
+                null,
+                (ushort)AirPlayConfig.ControlPort)
+            {
+                DnssdServiceInstanceName = $"{config.DeviceName}._airplay._tcp.local"
+            };
 
-            _mdns.Start();
-            return Task.CompletedTask;
+            // TXT record fields — must match what /info returns.
+            // 'features' uses comma-separated lo,hi 32-bit halves of the 64-bit bitmask.
+            var airplayTxt = _airplayInstance.TextAttributes;
+            airplayTxt["deviceid"]   = config.DeviceId;
+            airplayTxt["features"]   = AirPlayConfig.FeaturesHex;
+            airplayTxt["flags"]      = "0x0";   // statusFlags=0: no PIN
+            airplayTxt["model"]      = AirPlayConfig.Model;
+            airplayTxt["pk"]         = pkHex;
+            airplayTxt["pi"]         = config.PairingId;
+            airplayTxt["srcvers"]    = AirPlayConfig.ServerVersion;
+            airplayTxt["vv"]         = "2";
+
+            System.Diagnostics.Debug.WriteLine(
+                $"[mDNS] _airplay._tcp TXT: features={AirPlayConfig.FeaturesHex} pk={pkHex.Substring(0, 8)}…");
+
+            _airplayReg = await _airplayInstance.RegisterStreamSocketListenerAsync(
+                new StreamSocketListener());
+
+            System.Diagnostics.Debug.WriteLine(
+                $"[mDNS] _airplay._tcp registration status: {_airplayReg.Status}");
+
+            // ── _raop._tcp ────────────────────────────────────────────────────
+            // Instance name format: <MacAddressNoColons>@<DeviceName>
+            string macNc = config.DeviceId.Replace(":", "");
+            _raopInstance = new DnssdServiceInstance(
+                $"{macNc}@{config.DeviceName}._raop._tcp.local",
+                null,
+                (ushort)AirPlayConfig.ControlPort)
+            {
+                DnssdServiceInstanceName = $"{macNc}@{config.DeviceName}._raop._tcp.local"
+            };
+
+            var raopTxt = _raopInstance.TextAttributes;
+            raopTxt["am"]  = AirPlayConfig.Model;
+            raopTxt["et"]  = "0,3,5";   // encryption types: none, FairPlay, MFiSAP
+            raopTxt["ft"]  = AirPlayConfig.FeaturesHex;
+            raopTxt["md"]  = "0,1,2";   // media: audio, video, image
+            raopTxt["pk"]  = pkHex;
+            raopTxt["sf"]  = "0x0";     // statusFlags
+            raopTxt["tp"]  = "UDP";
+            raopTxt["vn"]  = "65537";
+            raopTxt["vs"]  = AirPlayConfig.ServerVersion;
+
+            System.Diagnostics.Debug.WriteLine(
+                $"[mDNS] _raop._tcp instance: {macNc}@{config.DeviceName}");
+
+            _raopReg = await _raopInstance.RegisterStreamSocketListenerAsync(
+                new StreamSocketListener());
+
+            System.Diagnostics.Debug.WriteLine(
+                $"[mDNS] _raop._tcp registration status: {_raopReg.Status}");
         }
 
-        public Task StopAsync()
+        public void Stop()
         {
-            if (_airplayProfile != null) _sd?.Unadvertise(_airplayProfile);
-            if (_raopProfile    != null) _sd?.Unadvertise(_raopProfile);
-            _mdns?.Stop();
-            return Task.CompletedTask;
+            _airplayReg?.Dispose();
+            _raopReg?.Dispose();
+            _airplayInstance = null;
+            _raopInstance    = null;
         }
-
-        // ── Profile builders ──────────────────────────────────────────────────
-
-        private ServiceProfile BuildAirPlayProfile()
-        {
-            // Instance name visible in the AirPlay picker
-            var p = new ServiceProfile(_config.DeviceName, "_airplay._tcp", AirPlayConfig.ControlPort);
-
-            p.AddProperty("deviceid", _config.DeviceId);
-            p.AddProperty("features", AirPlayConfig.FeaturesHex);
-            p.AddProperty("flags",    "0x4");
-            p.AddProperty("igl",      "1");
-            p.AddProperty("model",    AirPlayConfig.Model);
-            p.AddProperty("pi",       _config.PairingId);
-            p.AddProperty("pk",       ToHex(_config.Ed25519PublicKey));
-            p.AddProperty("psi",      "00000000-0000-0000-0000-000000000000");
-            p.AddProperty("srcvers",  AirPlayConfig.ServerVersion);
-            p.AddProperty("vv",       "2");
-            p.AddProperty("acl",      "0");
-
-            return p;
-        }
-
-        private ServiceProfile BuildRaopProfile()
-        {
-            // RAOP instance name: "AABBCCDDEEFF@DeviceName" (MAC without colons)
-            string raopName = _config.DeviceId.Replace(":", "") + "@" + _config.DeviceName;
-            var p = new ServiceProfile(raopName, "_raop._tcp", AirPlayConfig.RaopPort);
-
-            p.AddProperty("am",  AirPlayConfig.Model);
-            p.AddProperty("ch",  "2");
-            p.AddProperty("cn",  "0,1,2,3");  // PCM, ALAC, AAC, AAC-ELD
-            p.AddProperty("et",  "0,3,5");     // none, FairPlay, MFiSAP
-            p.AddProperty("ft",  AirPlayConfig.FeaturesHex);
-            p.AddProperty("md",  "0,1,2");
-            p.AddProperty("pk",  ToHex(_config.Ed25519PublicKey));
-            p.AddProperty("sr",  "44100");
-            p.AddProperty("ss",  "16");
-            p.AddProperty("sv",  "false");
-            p.AddProperty("tp",  "UDP");
-            p.AddProperty("vn",  "65537");
-            p.AddProperty("vs",  AirPlayConfig.ServerVersion);
-            p.AddProperty("vv",  "2");
-
-            return p;
-        }
-
-        private static string ToHex(byte[] b)
-            => string.Concat(b.Select(x => x.ToString("x2")));
     }
 }

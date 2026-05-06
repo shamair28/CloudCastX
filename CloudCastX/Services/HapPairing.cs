@@ -1,191 +1,182 @@
+// Pairing protocol ported from SteeBono/airplayreceiver (MIT License):
+//   https://github.com/SteeBono/airplayreceiver
 using System;
-using System.Collections.Generic;
-using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Tasks;
+using Org.BouncyCastle.Crypto.Agreement;
+using Org.BouncyCastle.Crypto.Generators;
 using Org.BouncyCastle.Crypto.Parameters;
 using Org.BouncyCastle.Crypto.Signers;
-using Org.BouncyCastle.Crypto.Generators;
-using Org.BouncyCastle.Crypto.Agreement;
 using Org.BouncyCastle.Security;
-using Org.BouncyCastle.Crypto;
 
 namespace CloudCast.Services
 {
-    // Implements Apple HomeKit Accessory Protocol (HAP) pairing:
-    //   pair-setup  → M1(state=1)→M2 (Ed25519 key exchange)
-    //   pair-verify → M1(state=1)→M2, M3(state=3)→M4 (ECDH + Ed25519 verify)
+    // Raw-byte AirPlay pairing (SteeBono-style, NOT TLV8/HAP).
+    //
+    // pair-setup:  32 bytes in (ignored) → 32 bytes out (Ed25519 public key)
+    // pair-verify: phase1: 68 bytes in → 96 bytes out (ECDH + encrypted sig)
+    //              phase2: 68 bytes in → 0 bytes out  (verify client sig)
     internal class HapPairing
     {
         private readonly AirPlayConfig _config;
-
-        private readonly byte[] _ecdhPrivateKey;
-        private readonly byte[] _ecdhPublicKey;
-
-        private byte[]? _verifyPrivateKey;
-        private byte[]? _verifyPublicKey;
-        private byte[]? _peerPublicKey;
+        private VerifyState? _verify;
 
         public byte[]? EcdhSharedSecret { get; private set; }
 
-        public HapPairing(AirPlayConfig config)
-        {
-            _config = config;
-            var gen = new X25519KeyPairGenerator();
-            gen.Init(new X25519KeyGenerationParameters(new SecureRandom()));
-            var kp = gen.GenerateKeyPair();
-            _ecdhPrivateKey = new byte[32];
-            _ecdhPublicKey  = new byte[32];
-            ((X25519PrivateKeyParameters)kp.Private).Encode(_ecdhPrivateKey, 0);
-            ((X25519PublicKeyParameters)kp.Public).Encode(_ecdhPublicKey, 0);
-        }
+        public HapPairing(AirPlayConfig config) => _config = config;
 
-        // ── pair-setup ────────────────────────────────────────────────────────
-        // iOS sends M1 (state=1). We respond with M2: our Ed25519 public key.
-        // Any other state is unexpected here — return null so the caller sends 470.
+        // ── pair-setup ──────────────────────────────────────────────────────
         public Task<byte[]?> HandlePairSetupAsync(byte[] body)
         {
-            var tlv = DecodeTlv8(body);
-            tlv.TryGetValue(0x06, out var stateBytes);
-            byte state = (stateBytes != null && stateBytes.Length > 0) ? stateBytes[0] : (byte)0;
-            System.Diagnostics.Debug.WriteLine($"[HAP] pair-setup received state={state}");
-
-            // Respond to M1 (state=1) or transient probe (state=0, empty body).
-            if (state != 1 && state != 0)
-            {
-                System.Diagnostics.Debug.WriteLine(
-                    $"[HAP] pair-setup: unexpected state {state}, expected 0 or 1 — rejecting");
-                return Task.FromResult<byte[]?>(null);
-            }
-
-            var response = EncodeTlv8(new Dictionary<byte, byte[]>
-            {
-                { 0x06, new byte[] { 0x02 } },      // state = M2
-                { 0x03, _config.Ed25519PublicKey },  // raw 32-byte Ed25519 public key
-            });
-
             System.Diagnostics.Debug.WriteLine(
-                $"[HAP] pair-setup M2: {response.Length} bytes, " +
-                $"pk={BitConverter.ToString(_config.Ed25519PublicKey, 0, 4)}…");
-
-            return Task.FromResult<byte[]?>(response);
+                $"[HAP] pair-setup: returning raw 32-byte Ed25519 pk (body={body.Length}B)");
+            return Task.FromResult<byte[]?>((byte[])_config.Ed25519PublicKey.Clone());
         }
 
-        // ── pair-verify ───────────────────────────────────────────────────────
+        // ── pair-verify ─────────────────────────────────────────────────────
         public Task<byte[]?> HandlePairVerifyAsync(byte[] body)
         {
-            var tlv = DecodeTlv8(body);
-            tlv.TryGetValue(0x06, out var stateBytes);
-            byte state = (stateBytes != null && stateBytes.Length > 0) ? stateBytes[0] : (byte)0;
-            System.Diagnostics.Debug.WriteLine($"[HAP] pair-verify received state={state}");
+            if (body == null || body.Length < 4)
+                return Task.FromResult<byte[]?>(null);
 
-            if (state == 1)
-                return Task.FromResult(HandleVerifyPhase1(tlv));
-            if (state == 3)
-                return Task.FromResult(HandleVerifyPhase2(tlv));
+            byte flag = body[0];
+            System.Diagnostics.Debug.WriteLine($"[HAP] pair-verify: flag={flag} body={body.Length}B");
 
-            System.Diagnostics.Debug.WriteLine($"[HAP] pair-verify unknown state {state}");
-            return Task.FromResult<byte[]?>(null);
+            byte[]? response = flag > 0
+                ? HandleVerifyPhase1(body)
+                : HandleVerifyPhase2(body);
+
+            return Task.FromResult(response);
         }
 
-        private byte[]? HandleVerifyPhase1(Dictionary<byte, byte[]> tlv)
+        private byte[]? HandleVerifyPhase1(byte[] body)
         {
-            System.Diagnostics.Debug.WriteLine("[HAP] pair-verify phase 1 start");
-
-            if (!tlv.TryGetValue(0x03, out _peerPublicKey) || _peerPublicKey.Length != 32)
+            if (body.Length < 68)
             {
-                System.Diagnostics.Debug.WriteLine("[HAP] pair-verify phase 1: missing/invalid peer public key");
+                System.Diagnostics.Debug.WriteLine("[HAP] pair-verify phase1: body too short");
                 return null;
             }
 
-            var gen = new X25519KeyPairGenerator();
-            gen.Init(new X25519KeyGenerationParameters(new SecureRandom()));
-            var kp = gen.GenerateKeyPair();
-            _verifyPrivateKey = new byte[32];
-            _verifyPublicKey  = new byte[32];
-            ((X25519PrivateKeyParameters)kp.Private).Encode(_verifyPrivateKey, 0);
-            ((X25519PublicKeyParameters)kp.Public).Encode(_verifyPublicKey, 0);
+            // Parse: [flag:1][pad:3][ecdh_theirs:32][ed_theirs:32]
+            var ecdhTheirs = new byte[32];
+            var edTheirs = new byte[32];
+            Buffer.BlockCopy(body, 4, ecdhTheirs, 0, 32);
+            Buffer.BlockCopy(body, 36, edTheirs, 0, 32);
 
+            // Generate ephemeral X25519 keypair
+            var kpGen = new X25519KeyPairGenerator();
+            kpGen.Init(new X25519KeyGenerationParameters(new SecureRandom()));
+            var kp = kpGen.GenerateKeyPair();
+            var ecdhOurs = ((X25519PublicKeyParameters)kp.Public).GetEncoded();
+            var ecdhPriv = (X25519PrivateKeyParameters)kp.Private;
+
+            // Compute shared secret
             var agreement = new X25519Agreement();
-            agreement.Init(new X25519PrivateKeyParameters(_verifyPrivateKey, 0));
-            EcdhSharedSecret = new byte[agreement.AgreementSize];
+            agreement.Init(ecdhPriv);
+            var sharedSecret = new byte[32];
             agreement.CalculateAgreement(
-                new X25519PublicKeyParameters(_peerPublicKey, 0), EcdhSharedSecret, 0);
+                new X25519PublicKeyParameters(ecdhTheirs, 0), sharedSecret, 0);
+
+            EcdhSharedSecret = (byte[])sharedSecret.Clone();
 
             System.Diagnostics.Debug.WriteLine(
-                $"[HAP] pair-verify phase 1: ECDH shared={BitConverter.ToString(EcdhSharedSecret, 0, 4)}…");
+                $"[HAP] pair-verify phase1: ECDH shared={BitConverter.ToString(sharedSecret, 0, 4)}…");
 
-            var msgToSign = Concat(_verifyPublicKey, _peerPublicKey);
-            var signature = Ed25519Sign(msgToSign, _config.Ed25519PrivateKey);
+            // Derive AES-CTR key and IV
+            var aesKey = DeriveHash("Pair-Verify-AES-Key", sharedSecret);
+            var aesIv = DeriveHash("Pair-Verify-AES-IV", sharedSecret);
 
-            var response = EncodeTlv8(new Dictionary<byte, byte[]>
+            // Sign (ecdhOurs | ecdhTheirs) with Ed25519
+            var signData = new byte[64];
+            Buffer.BlockCopy(ecdhOurs, 0, signData, 0, 32);
+            Buffer.BlockCopy(ecdhTheirs, 0, signData, 32, 32);
+            var signature = Ed25519Sign(_config.Ed25519PrivateKey, signData);
+
+            // Encrypt signature with AES/CTR
+            var cipher = CreateAesCtr(aesKey, aesIv, forEncryption: true);
+            var encryptedSig = new byte[64];
+            cipher.ProcessBytes(signature, 0, 64, encryptedSig, 0);
+
+            // Store state for phase 2
+            _verify = new VerifyState
             {
-                { 0x06, new byte[] { 0x02 } },
-                { 0x03, _verifyPublicKey },
-                { 0x09, signature },
-            });
-            System.Diagnostics.Debug.WriteLine(
-                $"[HAP] pair-verify phase 1 M2: {response.Length} bytes");
+                EcdhOurs = ecdhOurs,
+                EcdhTheirs = ecdhTheirs,
+                EdTheirs = edTheirs,
+                SharedSecret = sharedSecret,
+            };
+
+            // Response: [ecdhOurs:32][encryptedSig:64] = 96 bytes
+            var response = new byte[96];
+            Buffer.BlockCopy(ecdhOurs, 0, response, 0, 32);
+            Buffer.BlockCopy(encryptedSig, 0, response, 32, 64);
+
+            System.Diagnostics.Debug.WriteLine("[HAP] pair-verify phase1: returning 96 bytes");
             return response;
         }
 
-        private byte[]? HandleVerifyPhase2(Dictionary<byte, byte[]> tlv)
+        private byte[]? HandleVerifyPhase2(byte[] body)
         {
-            System.Diagnostics.Debug.WriteLine("[HAP] pair-verify phase 2 start");
-
-            if (EcdhSharedSecret == null || _verifyPublicKey == null || _peerPublicKey == null)
+            if (_verify == null || body.Length < 68)
             {
-                System.Diagnostics.Debug.WriteLine("[HAP] pair-verify phase 2: missing phase 1 state");
+                System.Diagnostics.Debug.WriteLine("[HAP] pair-verify phase2: missing state or body too short");
                 return null;
             }
 
-            if (!tlv.TryGetValue(0x05, out var encData) || encData.Length < 16)
-            {
-                System.Diagnostics.Debug.WriteLine("[HAP] pair-verify phase 2: missing encData");
-                return null;
-            }
+            // Parse: [flag:1][pad:3][encrypted_client_sig:64]
+            var clientEncSig = new byte[64];
+            Buffer.BlockCopy(body, 4, clientEncSig, 0, 64);
 
-            byte[] sessionKey = HkdfSha512(
-                EcdhSharedSecret,
-                Encoding.UTF8.GetBytes("Pair-Verify-Encrypt-Salt"),
-                Encoding.UTF8.GetBytes("Pair-Verify-Encrypt-Info"),
-                32);
+            // Re-derive cipher, advance past the 64 bytes used in phase 1
+            var aesKey = DeriveHash("Pair-Verify-AES-Key", _verify.SharedSecret);
+            var aesIv = DeriveHash("Pair-Verify-AES-IV", _verify.SharedSecret);
+            var cipher = CreateAesCtr(aesKey, aesIv, forEncryption: false);
 
+            // Advance counter by processing 64 dummy bytes (matches phase 1 state)
+            cipher.ProcessBytes(new byte[64], 0, 64, new byte[64], 0);
+
+            // Decrypt client's signature
+            var clientSig = new byte[64];
+            cipher.ProcessBytes(clientEncSig, 0, 64, clientSig, 0);
+
+            // Verify: Ed25519(edTheirs, ecdhTheirs | ecdhOurs, clientSig)
+            var verifyData = new byte[64];
+            Buffer.BlockCopy(_verify.EcdhTheirs, 0, verifyData, 0, 32);
+            Buffer.BlockCopy(_verify.EcdhOurs, 0, verifyData, 32, 32);
+
+            bool ok = Ed25519Verify(_verify.EdTheirs, verifyData, clientSig);
             System.Diagnostics.Debug.WriteLine(
-                $"[HAP] pair-verify phase 2: sessionKey={BitConverter.ToString(sessionKey, 0, 4)}…");
+                $"[HAP] pair-verify phase2: signature {(ok ? "VERIFIED" : "FAILED")}");
 
-            byte[]? plaintext = ChaCha20Poly1305Decrypt(
-                sessionKey, Encoding.UTF8.GetBytes("PV-Msg03"), encData);
-
-            if (plaintext == null)
-            {
-                System.Diagnostics.Debug.WriteLine(
-                    "[HAP] pair-verify phase 2: ChaCha20-Poly1305 decryption FAILED");
-                return null;
-            }
-
-            System.Diagnostics.Debug.WriteLine(
-                $"[HAP] pair-verify phase 2: decrypted {plaintext.Length} bytes OK");
-
-            var inner = DecodeTlv8(plaintext);
-            inner.TryGetValue(0x01, out var peerId);
-            System.Diagnostics.Debug.WriteLine(
-                $"[HAP] pair-verify phase 2: peerId=" +
-                (peerId != null ? Encoding.UTF8.GetString(peerId) : "null"));
-
-            var response = EncodeTlv8(new Dictionary<byte, byte[]>
-            {
-                { 0x06, new byte[] { 0x04 } }, // state = M4 — pairing complete
-            });
-            System.Diagnostics.Debug.WriteLine(
-                $"[HAP] pair-verify M4: {response.Length} bytes — pairing COMPLETE");
-            return response;
+            _verify = null;
+            return Array.Empty<byte>(); // empty response
         }
 
-        // ── Crypto helpers ────────────────────────────────────────────────────
+        // ── Crypto helpers ──────────────────────────────────────────────────
 
-        private static byte[] Ed25519Sign(byte[] message, byte[] privateKey)
+        private static byte[] DeriveHash(string label, byte[] sharedSecret)
+        {
+            using var sha = SHA512.Create();
+            var input = new byte[Encoding.UTF8.GetByteCount(label) + sharedSecret.Length];
+            Encoding.UTF8.GetBytes(label, 0, label.Length, input, 0);
+            Buffer.BlockCopy(sharedSecret, 0, input, input.Length - sharedSecret.Length, sharedSecret.Length);
+            var hash = sha.ComputeHash(input);
+            var result = new byte[16];
+            Buffer.BlockCopy(hash, 0, result, 0, 16);
+            return result;
+        }
+
+        private static Org.BouncyCastle.Crypto.IBufferedCipher CreateAesCtr(
+            byte[] key, byte[] iv, bool forEncryption)
+        {
+            var cipher = Org.BouncyCastle.Security.CipherUtilities.GetCipher("AES/CTR/NoPadding");
+            cipher.Init(forEncryption, new Org.BouncyCastle.Crypto.Parameters.ParametersWithIV(
+                Org.BouncyCastle.Security.ParameterUtilities.CreateKeyParameter("AES", key), iv));
+            return cipher;
+        }
+
+        private static byte[] Ed25519Sign(byte[] privateKey, byte[] message)
         {
             var signer = new Ed25519Signer();
             signer.Init(true, new Ed25519PrivateKeyParameters(privateKey, 0));
@@ -193,106 +184,24 @@ namespace CloudCast.Services
             return signer.GenerateSignature();
         }
 
-        private static byte[]? ChaCha20Poly1305Decrypt(
-            byte[] key, byte[] nonce, byte[] ciphertext)
+        private static bool Ed25519Verify(byte[] publicKey, byte[] message, byte[] signature)
         {
             try
             {
-                // HAP uses an 8-byte nonce left-padded to 12 bytes
-                var nonce12 = new byte[12];
-                Array.Copy(nonce, 0, nonce12, 4, Math.Min(nonce.Length, 8));
-
-                var cipher = new Org.BouncyCastle.Crypto.Modes.ChaCha20Poly1305();
-                cipher.Init(false, new Org.BouncyCastle.Crypto.Parameters.AeadParameters(
-                    new Org.BouncyCastle.Crypto.Parameters.KeyParameter(key), 128, nonce12));
-
-                var output = new byte[cipher.GetOutputSize(ciphertext.Length)];
-                int len = cipher.ProcessBytes(ciphertext, 0, ciphertext.Length, output, 0);
-                cipher.DoFinal(output, len);
-                return output;
+                var verifier = new Ed25519Signer();
+                verifier.Init(false, new Ed25519PublicKeyParameters(publicKey, 0));
+                verifier.BlockUpdate(message, 0, message.Length);
+                return verifier.VerifySignature(signature);
             }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine(
-                    $"[HAP] ChaCha20Poly1305Decrypt exception: {ex.Message}");
-                return null;
-            }
+            catch { return false; }
         }
 
-        private static byte[] HkdfSha512(byte[] ikm, byte[] salt, byte[] info, int outputLen)
+        private sealed class VerifyState
         {
-            using var hmacExtract = new HMACSHA512(salt);
-            byte[] prk = hmacExtract.ComputeHash(ikm);
-
-            var output = new System.Collections.Generic.List<byte>();
-            byte[] prev = Array.Empty<byte>();
-            byte counter = 1;
-            while (output.Count < outputLen)
-            {
-                using var hmacExpand = new HMACSHA512(prk);
-                hmacExpand.TransformBlock(prev, 0, prev.Length, null, 0);
-                hmacExpand.TransformBlock(info, 0, info.Length, null, 0);
-                hmacExpand.TransformFinalBlock(new[] { counter++ }, 0, 1);
-                prev = hmacExpand.Hash!;
-                output.AddRange(prev);
-            }
-            return output.Take(outputLen).ToArray();
-        }
-
-        // ── TLV8 codec ────────────────────────────────────────────────────────
-
-        internal static byte[] EncodeTlv8(Dictionary<byte, byte[]> items)
-        {
-            var result = new System.Collections.Generic.List<byte>();
-            foreach (var kv in items)
-            {
-                byte tag   = kv.Key;
-                byte[] value = kv.Value;
-                int offset = 0;
-                do
-                {
-                    int chunkLen = Math.Min(value.Length - offset, 255);
-                    result.Add(tag);
-                    result.Add((byte)chunkLen);
-                    result.AddRange(new ArraySegment<byte>(value, offset, chunkLen));
-                    offset += chunkLen;
-                } while (offset < value.Length);
-            }
-            return result.ToArray();
-        }
-
-        internal static Dictionary<byte, byte[]> DecodeTlv8(byte[] data)
-        {
-            var result = new Dictionary<byte, byte[]>();
-            int i = 0;
-            while (i + 1 < data.Length)
-            {
-                byte tag = data[i++];
-                int  len = data[i++];
-                if (i + len > data.Length) break;
-                var chunk = new ArraySegment<byte>(data, i, len);
-                i += len;
-                if (result.TryGetValue(tag, out var existing))
-                {
-                    var merged = new byte[existing.Length + len];
-                    existing.CopyTo(merged, 0);
-                    chunk.CopyTo(merged, existing.Length);
-                    result[tag] = merged;
-                }
-                else
-                {
-                    result[tag] = chunk.ToArray();
-                }
-            }
-            return result;
-        }
-
-        private static byte[] Concat(byte[] a, byte[] b)
-        {
-            var r = new byte[a.Length + b.Length];
-            a.CopyTo(r, 0);
-            b.CopyTo(r, a.Length);
-            return r;
+            public byte[] EcdhOurs = null!;
+            public byte[] EcdhTheirs = null!;
+            public byte[] EdTheirs = null!;
+            public byte[] SharedSecret = null!;
         }
     }
 }

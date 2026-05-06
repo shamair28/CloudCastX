@@ -45,6 +45,7 @@ namespace CloudCast.Services
             _listener = new StreamSocketListener();
             _listener.ConnectionReceived += OnConnectionReceived;
             await _listener.BindServiceNameAsync(AirPlayConfig.ControlPort.ToString());
+            System.Diagnostics.Debug.WriteLine($"[AirPlay] TCP listener ready on port {AirPlayConfig.ControlPort}");
         }
 
         public Task StopAsync()
@@ -385,21 +386,15 @@ namespace CloudCast.Services
             await EnsureEventSocketAsync();
             await EnsureTimingSocketAsync();
 
-            ushort timingPort = GetTimingPort();
-
             System.Diagnostics.Debug.WriteLine(
-                $"[AirPlay] SETUP initial: eventPort={_eventPort} timingPort={timingPort}");
+                $"[AirPlay] SETUP initial: returning empty 200 OK (sockets ready: event={_eventPort} timing={GetTimingPort()})");
 
-            // Start NTP timing to the client (uses the already-bound _timingSocket)
+            // Start NTP timing immediately (fire-and-forget, no delay)
             _ = StartNtpTimingAsync();
 
-            // Spec says: initial SETUP response must include eventPort and timingPort
-            var responseDict = new Dictionary<string, object>
-            {
-                ["eventPort"]  = (long)_eventPort,
-                ["timingPort"] = (long)timingPort,
-            };
-            return HttpResp.Ok(BinaryPlist.Encode(responseDict), "application/x-apple-binary-plist");
+            // Wire capture shows initial SETUP response is Content-Length: 0.
+            // eventPort/timingPort are returned in the stream SETUP response (CSeq 10).
+            return HttpResp.Ok(Array.Empty<byte>());
         }
 
         // Phase 2: Stream SETUP — parse the streams array, bind ports, echo type back.
@@ -611,11 +606,6 @@ namespace CloudCast.Services
 
                 System.Diagnostics.Debug.WriteLine(
                     $"[NTP] Starting timing to {_clientAddress}:{_clientTimingPort}");
-
-                // Wait for the SETUP response to be delivered to iOS before
-                // sending NTP packets — iOS won't recognize our timingPort until
-                // it has processed the SETUP response containing it.
-                await Task.Delay(500);
 
                 // Send a burst of 3 initial packets, then continue periodically
                 for (int i = 0; i < 3; i++)

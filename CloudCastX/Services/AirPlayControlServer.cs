@@ -612,11 +612,16 @@ namespace CloudCast.Services
                 System.Diagnostics.Debug.WriteLine(
                     $"[NTP] Starting timing to {_clientAddress}:{_clientTimingPort}");
 
+                // Wait for the SETUP response to be delivered to iOS before
+                // sending NTP packets — iOS won't recognize our timingPort until
+                // it has processed the SETUP response containing it.
+                await Task.Delay(500);
+
                 // Send a burst of 3 initial packets, then continue periodically
                 for (int i = 0; i < 3; i++)
                 {
                     await SendNtpPacketAsync();
-                    await Task.Delay(200);
+                    await Task.Delay(300);
                 }
 
                 _ = Task.Run(async () =>

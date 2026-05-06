@@ -215,6 +215,62 @@ namespace CloudCast.Services
                 ["srcvers"]                 = AirPlayConfig.ServerVersion,
                 ["statusFlags"]             = (long)0x04,
                 ["vv"]                      = (long)2,
+
+                // Display capabilities — required for iOS to know mirroring resolution
+                ["displays"] = new object[]
+                {
+                    new Dictionary<string, object>
+                    {
+                        ["width"]          = (long)1920,
+                        ["height"]         = (long)1080,
+                        ["widthPixels"]    = (long)1920,
+                        ["heightPixels"]   = (long)1080,
+                        ["widthPhysical"]  = (long)0,
+                        ["heightPhysical"] = (long)0,
+                        ["refreshRate"]    = (long)60,
+                        ["maxFPS"]         = (long)30,
+                        ["rotation"]       = false,
+                        ["overscanned"]    = false,
+                        ["features"]       = (long)14,
+                        ["uuid"]           = _config.PairingId,
+                    }
+                },
+
+                // Audio format capabilities
+                ["audioFormats"] = new object[]
+                {
+                    new Dictionary<string, object>
+                    {
+                        ["type"]               = (long)100,
+                        ["audioInputFormats"]  = (long)67108860,
+                        ["audioOutputFormats"] = (long)67108860,
+                    },
+                    new Dictionary<string, object>
+                    {
+                        ["type"]               = (long)101,
+                        ["audioInputFormats"]  = (long)67108860,
+                        ["audioOutputFormats"] = (long)67108860,
+                    }
+                },
+
+                // Audio latency info
+                ["audioLatencies"] = new object[]
+                {
+                    new Dictionary<string, object>
+                    {
+                        ["outputLatencyMicros"] = (long)0,
+                        ["type"]                = (long)100,
+                        ["audioType"]           = "default",
+                        ["inputLatencyMicros"]  = (long)0,
+                    },
+                    new Dictionary<string, object>
+                    {
+                        ["outputLatencyMicros"] = (long)0,
+                        ["type"]                = (long)101,
+                        ["audioType"]           = "default",
+                        ["inputLatencyMicros"]  = (long)0,
+                    }
+                },
             };
 
             System.Diagnostics.Debug.WriteLine(

@@ -17,29 +17,30 @@ namespace CloudCast.Services
         public const string Model          = "AppleTV5,3";
         public const string ServerVersion  = "220.68";
 
-        // Bug 3 fix: separate ports to avoid bind conflicts.
         public const ushort ControlPort    = 7000;
-        public const ushort TimingPort     = 7001;  // NTP timing sync channel
-        public const ushort EventPort      = 7002;  // AirPlay event channel
-        public const ushort VideoPort      = 7100;  // mirroring video data
+        public const ushort TimingPort     = 7001;
+        public const ushort EventPort      = 7002;
+        public const ushort VideoPort      = 7100;
         public const ushort RaopPort       = 5000;
 
-        // Features bitmask advertised to Apple devices (matches known-working values
-        // from open-source AirPlay 2 implementations such as SteeBono/airplayreceiver).
-        // Encodes: Video, Screen, Audio, AudioRedundant, FPSAPv2pt5_AES_GCM,
-        // Authentication4 (HAP), various AudioFormat/Metadata flags.
-        public const string FeaturesHex = "0x4A7FFFF7,0x0E";
+        // Features bitmask — Option A: Transient pairing (no PIN)
+        //
+        // Authentication4 is bit 3 of the low dword (0x00000008).
+        // Setting it forces iOS into HAP PIN pairing mode.
+        // Clearing it enables transient pairing: iOS connects instantly
+        // with no on-screen PIN required, identical to RPiPlay / UxPlay behaviour.
+        //
+        // Before: 0x0E4A7FFFF7  (Authentication4 SET   → PIN required)
+        //  After: 0x0E4A7FFFEF  (Authentication4 CLEAR → transient pairing)
+        public const string FeaturesHex = "0x4A7FFFEF,0x0E";
+        public const long   Features    = unchecked((long)0x0E4A7FFFEF L);
 
-        // Packed 64-bit form used in the binary plist /info response.
-        public const long Features = unchecked((long)0x0E4A7FFFF7L);
-
-        // ── Instance identity ──────────────────────────────────────────────────
+        // ── Instance identity ────────────────────────────────────────────────
 
         public string DeviceName    { get; private set; } = "CloudCastXTest";
-        public string DeviceId      { get; private set; } = string.Empty;  // MAC-style
-        public string PairingId     { get; private set; } = string.Empty;  // UUID
+        public string DeviceId      { get; private set; } = string.Empty;
+        public string PairingId     { get; private set; } = string.Empty;
 
-        // Ed25519 key pair used for HAP pairing handshake
         public byte[] Ed25519PublicKey  { get; private set; } = Array.Empty<byte>();
         public byte[] Ed25519PrivateKey { get; private set; } = Array.Empty<byte>();
 
@@ -75,14 +76,14 @@ namespace CloudCast.Services
             return cfg;
         }
 
-        // ── Helpers ───────────────────────────────────────────────────────────
+        // ── Helpers ────────────────────────────────────────────────────────────
 
         private static string GenerateMac()
         {
             var rng = new SecureRandom();
             var b = new byte[6];
             rng.NextBytes(b);
-            b[0] = (byte)((b[0] & 0xFE) | 0x02); // locally administered unicast
+            b[0] = (byte)((b[0] & 0xFE) | 0x02);
             return string.Join(":", b.Select(x => x.ToString("X2")));
         }
 

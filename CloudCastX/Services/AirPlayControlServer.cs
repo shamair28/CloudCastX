@@ -9,9 +9,6 @@ using Windows.UI.Xaml.Controls;
 
 namespace CloudCast.Services
 {
-    // HTTP/1.1 server on port 7000 that implements the AirPlay 2 control plane.
-    // Uses Windows.Networking.Sockets.StreamSocketListener (the UWP-native approach)
-    // instead of HttpListener which is not available in the UWP app container.
     internal class AirPlayControlServer
     {
         private readonly AirPlayConfig _config;
@@ -21,7 +18,6 @@ namespace CloudCast.Services
         private StreamSocketListener? _listener;
         private MirroringSession? _activeSession;
 
-        // Crypto state accumulated across the connection handshake, used for stream decryption.
         private byte[]? _encryptedAesKey;
         private byte[]? _aesIv;
         private string? _streamConnectionId;
@@ -51,15 +47,12 @@ namespace CloudCast.Services
             return Task.CompletedTask;
         }
 
-        // ── Connection handling ──────────────────────────────────────────────
-
         private async void OnConnectionReceived(StreamSocketListener sender,
             StreamSocketListenerConnectionReceivedEventArgs args)
         {
             try
             {
                 using var socket = args.Socket;
-                // A single TCP connection can carry multiple pipelined requests
                 while (true)
                 {
                     var req = await ReadRequestAsync(socket);
@@ -68,7 +61,6 @@ namespace CloudCast.Services
                     var resp = await HandleRequestAsync(req);
                     await SendResponseAsync(socket, resp);
 
-                    // HTTP/1.1 defaults to keep-alive; only close on explicit "Connection: close"
                     if (req.Headers.TryGetValue("Connection", out var conn) &&
                         conn.Equals("close", StringComparison.OrdinalIgnoreCase))
                         break;
@@ -76,8 +68,6 @@ namespace CloudCast.Services
             }
             catch { /* client disconnected */ }
         }
-
-        // ── Request reader ────────────────────────────────────────────────
 
         private static async Task<HttpReq?> ReadRequestAsync(StreamSocket socket)
         {
@@ -89,11 +79,10 @@ namespace CloudCast.Services
             var lines = new List<string>();
             var lineBytes = new List<byte>();
 
-            // Read headers byte-by-byte (control traffic is small; correctness > speed)
             while (true)
             {
                 uint loaded = await reader.LoadAsync(1);
-                if (loaded == 0) return null; // connection closed
+                if (loaded == 0) return null;
 
                 byte b = reader.ReadByte();
                 lineBytes.Add(b);
@@ -103,20 +92,18 @@ namespace CloudCast.Services
                 {
                     string line = Encoding.UTF8.GetString(lineBytes.ToArray(), 0, n - 2);
                     lineBytes.Clear();
-                    if (line.Length == 0) break; // blank line ends headers
+                    if (line.Length == 0) break;
                     lines.Add(line);
                 }
             }
 
             if (lines.Count == 0) return null;
 
-            // Parse request line
             var parts = lines[0].Split(' ');
             if (parts.Length < 2) return null;
             string method = parts[0];
-            string path   = parts[1].Split('?')[0]; // strip query string
+            string path   = parts[1].Split('?')[0];
 
-            // Parse headers
             var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             for (int i = 1; i < lines.Count; i++)
             {
@@ -125,7 +112,6 @@ namespace CloudCast.Services
                     headers[lines[i].Substring(0, colon).Trim()] = lines[i].Substring(colon + 1).Trim();
             }
 
-            // Read body
             byte[] body = Array.Empty<byte>();
             if (headers.TryGetValue("Content-Length", out string? clStr) &&
                 int.TryParse(clStr, out int cl) && cl > 0)
@@ -137,8 +123,6 @@ namespace CloudCast.Services
 
             return new HttpReq(method, path, headers, body);
         }
-
-        // ── Response writer ────────────────────────────────────────────────
 
         private static async Task SendResponseAsync(StreamSocket socket, HttpResp resp)
         {
@@ -162,8 +146,6 @@ namespace CloudCast.Services
             await writer.FlushAsync();
             writer.DetachStream();
         }
-
-        // ── Request dispatcher ──────────────────────────────────────────────
 
         private async Task<HttpResp> HandleRequestAsync(HttpReq req)
         {
@@ -190,16 +172,12 @@ namespace CloudCast.Services
             }
         }
 
-        // ── Endpoint handlers ───────────────────────────────────────────────
-
         private HttpResp HandleInfo()
         {
-            // Build binary plist with device capabilities.
-            //
-            // CRITICAL: pk MUST be sent as a raw byte[] (binary plist type 0x4x DATA),
-            // NOT as a hex string (type 0x5x ASCII). iOS compares the raw public key
-            // bytes it receives in pair-setup M2 against the pk field from /info.
-            // If the types differ, iOS silently drops the connection after M2.
+            // pk must be raw bytes (binary plist DATA type 0x4x).
+            // statusFlags=0x04 = transient pairing supported.
+            //   0x00 would mean "already paired" which iOS rejects on first contact.
+            //   0x04 means "I support transient pairing, no PIN needed".
             var dict = new Dictionary<string, object>
             {
                 ["deviceID"]                = _config.DeviceId,
@@ -210,19 +188,17 @@ namespace CloudCast.Services
                 ["model"]                   = AirPlayConfig.Model,
                 ["name"]                    = _config.DeviceName,
                 ["pi"]                      = _config.PairingId,
-                // Raw bytes — BinaryPlist.Encode writes this as type 0x4x (data), which
-                // is what iOS expects. A hex string would be type 0x5x and would fail.
                 ["pk"]                      = _config.Ed25519PublicKey,
                 ["psi"]                     = "00000000-0000-0000-0000-000000000000",
                 ["srcvers"]                 = AirPlayConfig.ServerVersion,
-                // statusFlags=0: no PIN required for transient pairing.
-                ["statusFlags"]             = (long)0,
+                ["statusFlags"]             = (long)0x04,
                 ["vv"]                      = (long)2,
             };
 
             System.Diagnostics.Debug.WriteLine(
-                $"[AirPlay] /info: pk as raw bytes ({_config.Ed25519PublicKey.Length}B), " +
-                $"features=0x{AirPlayConfig.Features:X}");
+                $"[AirPlay] /info: statusFlags=0x04 (transient), " +
+                $"features=0x{AirPlayConfig.Features:X}, " +
+                $"pk={BitConverter.ToString(_config.Ed25519PublicKey, 0, 4)}…");
 
             byte[] plist = BinaryPlist.Encode(dict);
             return HttpResp.Ok(plist, "application/x-apple-binary-plist");
@@ -233,7 +209,7 @@ namespace CloudCast.Services
             var response = await _hap.HandlePairSetupAsync(req.Body);
             return response != null
                 ? HttpResp.Ok(response, "application/octet-stream")
-                : HttpResp.Error(470); // 470 = connection authorization required
+                : HttpResp.Error(470);
         }
 
         private async Task<HttpResp> HandlePairVerifyAsync(HttpReq req)
@@ -257,10 +233,7 @@ namespace CloudCast.Services
             if (req.Body.Length == 0)
                 return HttpResp.Ok(Array.Empty<byte>());
 
-            try
-            {
-                return await HandleSetupPlistAsync(req.Body);
-            }
+            try   { return await HandleSetupPlistAsync(req.Body); }
             catch (Exception ex)
             {
                 System.Diagnostics.Debug.WriteLine($"[AirPlay] SETUP error: {ex.Message}");
@@ -277,17 +250,17 @@ namespace CloudCast.Services
             if (plist.TryGetValue("ekey", out var ekeyObj) && ekeyObj is byte[] ekey)
             {
                 _encryptedAesKey = ekey;
-                System.Diagnostics.Debug.WriteLine($"[AirPlay] SETUP received ekey ({ekey.Length} bytes)");
+                System.Diagnostics.Debug.WriteLine($"[AirPlay] SETUP: ekey ({ekey.Length}B)");
             }
             if (plist.TryGetValue("eiv", out var eivObj) && eivObj is byte[] eiv)
             {
                 _aesIv = eiv;
-                System.Diagnostics.Debug.WriteLine($"[AirPlay] SETUP received eiv ({eiv.Length} bytes)");
+                System.Diagnostics.Debug.WriteLine($"[AirPlay] SETUP: eiv ({eiv.Length}B)");
             }
             if (plist.TryGetValue("streamConnectionID", out var scid))
             {
                 _streamConnectionId = scid.ToString();
-                System.Diagnostics.Debug.WriteLine($"[AirPlay] SETUP streamConnectionID: {_streamConnectionId}");
+                System.Diagnostics.Debug.WriteLine($"[AirPlay] SETUP: streamConnectionID={_streamConnectionId}");
             }
 
             _activeSession?.Stop();
@@ -295,7 +268,7 @@ namespace CloudCast.Services
             await _activeSession.BindUdpAsync();
 
             System.Diagnostics.Debug.WriteLine(
-                $"[AirPlay] SETUP: video dataPort = {_activeSession.VideoPort}");
+                $"[AirPlay] SETUP: video dataPort={_activeSession.VideoPort}");
 
             var responseDict = new Dictionary<string, object>
             {
@@ -319,7 +292,7 @@ namespace CloudCast.Services
             if (req.Body.Length > 0)
             {
                 try { plist = BinaryPlist.Decode(req.Body); }
-                catch { /* not a valid plist */ }
+                catch { }
             }
 
             if (plist != null)
@@ -335,8 +308,7 @@ namespace CloudCast.Services
             if (_fp.KeyMsg == null)
             {
                 System.Diagnostics.Debug.WriteLine(
-                    "[AirPlay] /stream: FairPlay key exchange not complete — KeyMsg is null");
-                StatusChanged?.Invoke("FairPlay key exchange incomplete.");
+                    "[AirPlay] /stream: FairPlay KeyMsg null — fp-setup not complete");
                 return HttpResp.Error(403);
             }
 
@@ -396,23 +368,15 @@ namespace CloudCast.Services
         }
     }
 
-    // ── Lightweight HTTP message types ─────────────────────────────────────────────
-
     internal class HttpReq
     {
         public string Method  { get; }
         public string Path    { get; }
         public Dictionary<string, string> Headers { get; }
         public byte[] Body    { get; }
-
         public HttpReq(string method, string path,
             Dictionary<string, string> headers, byte[] body)
-        {
-            Method  = method;
-            Path    = path;
-            Headers = headers;
-            Body    = body;
-        }
+        { Method = method; Path = path; Headers = headers; Body = body; }
     }
 
     internal class HttpResp
@@ -421,7 +385,7 @@ namespace CloudCast.Services
         public string StatusText  { get; set; } = "OK";
         public byte[] Body        { get; set; } = Array.Empty<byte>();
         public string ContentType { get; set; } = string.Empty;
-        public Dictionary<string, string> ExtraHeaders { get; set; } = new Dictionary<string, string>();
+        public Dictionary<string, string> ExtraHeaders { get; set; } = new();
 
         public static HttpResp Ok(byte[] body, string? contentType = null) => new HttpResp
         {
@@ -433,14 +397,13 @@ namespace CloudCast.Services
 
         public static HttpResp Error(int code)
         {
-            string text;
-            switch (code)
+            string text = code switch
             {
-                case 403: text = "Forbidden"; break;
-                case 470: text = "Connection Authorization Required"; break;
-                case 500: text = "Internal Server Error"; break;
-                default:  text = "Error"; break;
-            }
+                403  => "Forbidden",
+                470  => "Connection Authorization Required",
+                500  => "Internal Server Error",
+                _    => "Error",
+            };
             return new HttpResp { StatusCode = code, StatusText = text };
         }
     }

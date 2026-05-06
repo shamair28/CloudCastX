@@ -19,6 +19,8 @@ namespace CloudCast.Services
         private MirroringSession? _activeSession;
         private DatagramSocket? _audioSocket;
         private DatagramSocket? _timingSocket;
+        private DatagramSocket? _eventSocket;
+        private ushort _eventPort;
 
         private byte[]? _encryptedAesKey;
         private byte[]? _aesIv;
@@ -307,25 +309,22 @@ namespace CloudCast.Services
         // on the existing TCP listener (unrecognized requests return 200 OK).
         private async Task<HttpResp> HandleInitialSetupAsync()
         {
-            System.Diagnostics.Debug.WriteLine(
-                $"[AirPlay] SETUP initial: timingPort={AirPlayConfig.ControlPort}, " +
-                $"eventPort={AirPlayConfig.ControlPort}");
-
-            var responseDict = new Dictionary<string, object>
-            {
-                ["timingPort"] = (long)AirPlayConfig.ControlPort,
-                ["eventPort"]  = (long)AirPlayConfig.ControlPort,
-            };
+            // Wire capture shows the initial SETUP response is Content-Length: 0.
+            // eventPort/timingPort go in the stream SETUP response (CSeq:10), not here.
+            System.Diagnostics.Debug.WriteLine("[AirPlay] SETUP initial: returning empty 200 OK");
 
             // Start NTP timing — iOS waits for timing sync before sending the stream SETUP
             _ = StartNtpTimingAsync();
 
-            return HttpResp.Ok(BinaryPlist.Encode(responseDict), "application/x-apple-binary-plist");
+            return HttpResp.Ok(Array.Empty<byte>());
         }
 
         // Phase 2: Stream SETUP — parse the streams array, bind ports, echo type back.
+        // Response includes eventPort + timingPort (real UDP) alongside the streams array.
         private async Task<HttpResp> HandleStreamSetupAsync(Dictionary<string, object> plist)
         {
+            await EnsureEventSocketAsync();
+
             long streamType = 110;
             if (plist.TryGetValue("streams", out var streamsObj) && streamsObj is object[] arr && arr.Length > 0)
             {
@@ -359,8 +358,15 @@ namespace CloudCast.Services
                     $"[AirPlay] SETUP stream: type={streamType} (audio) dataPort={dataPort}");
             }
 
+            ushort timingPort = GetTimingPort();
+            System.Diagnostics.Debug.WriteLine(
+                $"[AirPlay] SETUP stream response: type={streamType} dataPort={dataPort} " +
+                $"eventPort={_eventPort} timingPort={timingPort}");
+
             var responseDict = new Dictionary<string, object>
             {
+                ["eventPort"]  = (long)_eventPort,
+                ["timingPort"] = (long)timingPort,
                 ["streams"] = new object[]
                 {
                     new Dictionary<string, object>
@@ -457,8 +463,37 @@ namespace CloudCast.Services
             _audioSocket = null;
             _timingSocket?.Dispose();
             _timingSocket = null;
+            _eventSocket?.Dispose();
+            _eventSocket = null;
             StreamingStopped?.Invoke();
             return HttpResp.Ok(Array.Empty<byte>());
+        }
+
+        // ── Event + timing port helpers ───────────────────────────────────────
+
+        private async Task EnsureEventSocketAsync()
+        {
+            if (_eventSocket != null) return;
+            _eventSocket = new DatagramSocket();
+            _eventSocket.MessageReceived += (s, e) =>
+            {
+                using var reader = e.GetDataReader();
+                System.Diagnostics.Debug.WriteLine(
+                    $"[AirPlay] Event received: {reader.UnconsumedBufferLength} bytes");
+            };
+            await _eventSocket.BindServiceNameAsync("0");
+            _eventPort = ushort.Parse(_eventSocket.Information.LocalPort);
+            System.Diagnostics.Debug.WriteLine($"[AirPlay] Event socket bound on port {_eventPort}");
+        }
+
+        private ushort GetTimingPort()
+        {
+            if (_timingSocket != null)
+            {
+                try { return ushort.Parse(_timingSocket.Information.LocalPort); }
+                catch { }
+            }
+            return (ushort)AirPlayConfig.ControlPort;
         }
 
         // ── NTP timing ───────────────────────────────────────────────────────

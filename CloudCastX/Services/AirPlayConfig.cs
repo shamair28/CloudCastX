@@ -35,7 +35,7 @@ namespace CloudCast.Services
 
         // ── Instance identity ──────────────────────────────────────────────────
 
-        public string DeviceName    { get; private set; } = "CloudCast";
+        public string DeviceName    { get; private set; } = "CloudCastXTest";
         public string DeviceId      { get; private set; } = string.Empty;  // MAC-style
         public string PairingId     { get; private set; } = string.Empty;  // UUID
 

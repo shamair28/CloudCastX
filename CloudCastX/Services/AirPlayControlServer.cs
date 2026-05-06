@@ -69,6 +69,7 @@ namespace CloudCast.Services
 
                     var resp = await HandleRequestAsync(req);
                     await SendResponseAsync(socket, resp, req);
+                    System.Diagnostics.Debug.WriteLine("[WIRE] --- waiting for next request ---");
 
                     if (req.Headers.TryGetValue("Connection", out var conn) &&
                         conn.Equals("close", StringComparison.OrdinalIgnoreCase))
@@ -139,6 +140,12 @@ namespace CloudCast.Services
                 reader.ReadBytes(body);
             }
 
+            System.Diagnostics.Debug.WriteLine($"[WIRE] >>> {method} {path} {protocol}");
+            foreach (var h in headers)
+                System.Diagnostics.Debug.WriteLine($"[WIRE] >>> {h.Key}: {h.Value}");
+            if (body.Length > 0)
+                System.Diagnostics.Debug.WriteLine($"[WIRE] >>> Body: {body.Length} bytes [{BitConverter.ToString(body, 0, Math.Min(body.Length, 64))}]");
+
             return new HttpReq(method, path, protocol, headers, body);
         }
 
@@ -159,6 +166,15 @@ namespace CloudCast.Services
             foreach (var h in resp.ExtraHeaders)
                 sb.Append($"{h.Key}: {h.Value}\r\n");
             sb.Append("\r\n");
+
+            System.Diagnostics.Debug.WriteLine($"[WIRE] <<< {req.Protocol} {resp.StatusCode} {resp.StatusText}");
+            if (req.Headers.TryGetValue("CSeq", out var cseqLog))
+                System.Diagnostics.Debug.WriteLine($"[WIRE] <<< CSeq: {cseqLog}");
+            System.Diagnostics.Debug.WriteLine($"[WIRE] <<< Content-Length: {resp.Body.Length}");
+            if (!string.IsNullOrEmpty(resp.ContentType))
+                System.Diagnostics.Debug.WriteLine($"[WIRE] <<< Content-Type: {resp.ContentType}");
+            if (resp.Body.Length > 0)
+                System.Diagnostics.Debug.WriteLine($"[WIRE] <<< Body: [{BitConverter.ToString(resp.Body, 0, Math.Min(resp.Body.Length, 128))}]");
 
             writer.WriteBytes(Encoding.ASCII.GetBytes(sb.ToString()));
             if (resp.Body.Length > 0)
@@ -545,8 +561,11 @@ namespace CloudCast.Services
             _eventSocket.MessageReceived += (s, e) =>
             {
                 using var reader = e.GetDataReader();
+                uint len = reader.UnconsumedBufferLength;
+                byte[] data = new byte[len];
+                reader.ReadBytes(data);
                 System.Diagnostics.Debug.WriteLine(
-                    $"[AirPlay] Event received: {reader.UnconsumedBufferLength} bytes");
+                    $"[AirPlay] Event received: {len} bytes [{BitConverter.ToString(data, 0, Math.Min((int)len, 32))}]");
             };
             await _eventSocket.BindServiceNameAsync("0");
             _eventPort = ushort.Parse(_eventSocket.Information.LocalPort);
@@ -670,7 +689,10 @@ namespace CloudCast.Services
             {
                 using var reader = e.GetDataReader();
                 uint len = reader.UnconsumedBufferLength;
-                System.Diagnostics.Debug.WriteLine($"[NTP] Received {len}-byte timing response");
+                byte[] data = new byte[len];
+                reader.ReadBytes(data);
+                System.Diagnostics.Debug.WriteLine(
+                    $"[NTP] Received {len}-byte timing response: [{BitConverter.ToString(data, 0, Math.Min((int)len, 32))}]");
             }
             catch { }
         }

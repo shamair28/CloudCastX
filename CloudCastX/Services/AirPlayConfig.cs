@@ -21,11 +21,18 @@ namespace CloudCast.Services
         public const ushort RaopPort    = 5000;
 
         // Features bitmask — Option A: Transient pairing (no PIN)
-        // Authentication4 (bit 3, 0x8) cleared → iOS uses transient pairing, no PIN prompt.
-        // Before: 0x0E4A7FFFF7  (bit 3 SET   → PIN required)
-        //  After: 0x0E4A7FFFEF  (bit 3 CLEAR → transient, no PIN)
-        public const string FeaturesHex = "0x4A7FFFEF,0x0E";
-        public const long   Features    = unchecked((long)0x0E4A7FFFEF);
+        //
+        // Authentication4 = bit 27 = 0x08000000 (NOT bit 3).
+        // Previous attempt cleared bits 3+4 (0x18) which had no effect.
+        //
+        // Correct calculation:
+        //   0x0E4A7FFFF7 & ~0x08000000 = 0x0E427FFFF7
+        //   lo-dword: 0x427FFFF7   hi-dword: 0x0E
+        //
+        // With Authentication4 cleared, iOS uses transient pairing and
+        // does NOT prompt for a PIN code.
+        public const string FeaturesHex = "0x427FFFF7,0x0E";
+        public const long   Features    = unchecked((long)0x0E427FFFF7);
 
         // ── Instance identity ──────────────────────────────────────────────────
 

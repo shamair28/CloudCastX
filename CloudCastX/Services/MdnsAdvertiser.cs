@@ -1,7 +1,4 @@
 using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
 using System.Threading.Tasks;
 using Windows.Networking.ServiceDiscovery.Dnssd;
 using Windows.Networking.Sockets;
@@ -15,39 +12,40 @@ namespace CloudCast.Services
     //                    the AirPlay picker even for video-only receivers)
     internal class MdnsAdvertiser
     {
+        private readonly AirPlayConfig _config;
         private DnssdServiceInstance? _airplayInstance;
         private DnssdServiceInstance? _raopInstance;
         private DnssdRegistrationResult? _airplayReg;
         private DnssdRegistrationResult? _raopReg;
 
-        public async Task StartAsync(AirPlayConfig config)
+        public MdnsAdvertiser(AirPlayConfig config)
+        {
+            _config = config;
+        }
+
+        public async Task StartAsync()
         {
             System.Diagnostics.Debug.WriteLine(
-                $"[mDNS] Registering '{config.DeviceName}' on port {AirPlayConfig.ControlPort}");
+                $"[mDNS] Registering '{_config.DeviceName}' on port {AirPlayConfig.ControlPort}");
 
-            string pkHex = BitConverter.ToString(config.Ed25519PublicKey)
+            string pkHex = BitConverter.ToString(_config.Ed25519PublicKey)
                                .Replace("-", "").ToLowerInvariant();
 
             // ── _airplay._tcp ─────────────────────────────────────────────────
             _airplayInstance = new DnssdServiceInstance(
-                $"{config.DeviceName}._airplay._tcp.local",
+                $"{_config.DeviceName}._airplay._tcp.local",
                 null,
-                (ushort)AirPlayConfig.ControlPort)
-            {
-                DnssdServiceInstanceName = $"{config.DeviceName}._airplay._tcp.local"
-            };
+                (ushort)AirPlayConfig.ControlPort);
 
-            // TXT record fields — must match what /info returns.
-            // 'features' uses comma-separated lo,hi 32-bit halves of the 64-bit bitmask.
             var airplayTxt = _airplayInstance.TextAttributes;
-            airplayTxt["deviceid"]   = config.DeviceId;
-            airplayTxt["features"]   = AirPlayConfig.FeaturesHex;
-            airplayTxt["flags"]      = "0x0";   // statusFlags=0: no PIN
-            airplayTxt["model"]      = AirPlayConfig.Model;
-            airplayTxt["pk"]         = pkHex;
-            airplayTxt["pi"]         = config.PairingId;
-            airplayTxt["srcvers"]    = AirPlayConfig.ServerVersion;
-            airplayTxt["vv"]         = "2";
+            airplayTxt["deviceid"] = _config.DeviceId;
+            airplayTxt["features"] = AirPlayConfig.FeaturesHex;
+            airplayTxt["flags"]    = "0x0";
+            airplayTxt["model"]    = AirPlayConfig.Model;
+            airplayTxt["pk"]       = pkHex;
+            airplayTxt["pi"]       = _config.PairingId;
+            airplayTxt["srcvers"]  = AirPlayConfig.ServerVersion;
+            airplayTxt["vv"]       = "2";
 
             System.Diagnostics.Debug.WriteLine(
                 $"[mDNS] _airplay._tcp TXT: features={AirPlayConfig.FeaturesHex} pk={pkHex.Substring(0, 8)}…");
@@ -59,29 +57,25 @@ namespace CloudCast.Services
                 $"[mDNS] _airplay._tcp registration status: {_airplayReg.Status}");
 
             // ── _raop._tcp ────────────────────────────────────────────────────
-            // Instance name format: <MacAddressNoColons>@<DeviceName>
-            string macNc = config.DeviceId.Replace(":", "");
+            string macNc = _config.DeviceId.Replace(":", "");
             _raopInstance = new DnssdServiceInstance(
-                $"{macNc}@{config.DeviceName}._raop._tcp.local",
+                $"{macNc}@{_config.DeviceName}._raop._tcp.local",
                 null,
-                (ushort)AirPlayConfig.ControlPort)
-            {
-                DnssdServiceInstanceName = $"{macNc}@{config.DeviceName}._raop._tcp.local"
-            };
+                (ushort)AirPlayConfig.ControlPort);
 
             var raopTxt = _raopInstance.TextAttributes;
-            raopTxt["am"]  = AirPlayConfig.Model;
-            raopTxt["et"]  = "0,3,5";   // encryption types: none, FairPlay, MFiSAP
-            raopTxt["ft"]  = AirPlayConfig.FeaturesHex;
-            raopTxt["md"]  = "0,1,2";   // media: audio, video, image
-            raopTxt["pk"]  = pkHex;
-            raopTxt["sf"]  = "0x0";     // statusFlags
-            raopTxt["tp"]  = "UDP";
-            raopTxt["vn"]  = "65537";
-            raopTxt["vs"]  = AirPlayConfig.ServerVersion;
+            raopTxt["am"] = AirPlayConfig.Model;
+            raopTxt["et"] = "0,3,5";
+            raopTxt["ft"] = AirPlayConfig.FeaturesHex;
+            raopTxt["md"] = "0,1,2";
+            raopTxt["pk"] = pkHex;
+            raopTxt["sf"] = "0x0";
+            raopTxt["tp"] = "UDP";
+            raopTxt["vn"] = "65537";
+            raopTxt["vs"] = AirPlayConfig.ServerVersion;
 
             System.Diagnostics.Debug.WriteLine(
-                $"[mDNS] _raop._tcp instance: {macNc}@{config.DeviceName}");
+                $"[mDNS] _raop._tcp instance: {macNc}@{_config.DeviceName}");
 
             _raopReg = await _raopInstance.RegisterStreamSocketListenerAsync(
                 new StreamSocketListener());
@@ -90,12 +84,16 @@ namespace CloudCast.Services
                 $"[mDNS] _raop._tcp registration status: {_raopReg.Status}");
         }
 
-        public void Stop()
+        // DnssdRegistrationResult does not implement IDisposable in WinRT —
+        // release by nulling references so the GC can collect them.
+        public Task StopAsync()
         {
-            _airplayReg?.Dispose();
-            _raopReg?.Dispose();
+            _airplayReg = null;
+            _raopReg    = null;
             _airplayInstance = null;
             _raopInstance    = null;
+            System.Diagnostics.Debug.WriteLine("[mDNS] Stopped");
+            return Task.CompletedTask;
         }
     }
 }

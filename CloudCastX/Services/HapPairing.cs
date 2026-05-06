@@ -14,7 +14,7 @@ using Org.BouncyCastle.Crypto;
 namespace CloudCast.Services
 {
     // Implements Apple HomeKit Accessory Protocol (HAP) pairing:
-    //   pair-setup  → M1→M2 (SRP not used; we do raw Ed25519 key exchange)
+    //   pair-setup  → M1→M2 (Ed25519 key exchange)
     //   pair-verify → M1→M2 (ECDH shared secret + Ed25519 signature verification)
     //
     // TLV8 tag constants (HAP spec §4):
@@ -29,7 +29,7 @@ namespace CloudCast.Services
         private readonly byte[] _ecdhPrivateKey;
         private readonly byte[] _ecdhPublicKey;
 
-        // Shared secret derived during pair-verify phase 1, consumed in phase 2
+        // Ephemeral keys generated per verify session
         private byte[]? _verifyPrivateKey;
         private byte[]? _verifyPublicKey;
         private byte[]? _peerPublicKey;
@@ -40,7 +40,6 @@ namespace CloudCast.Services
         public HapPairing(AirPlayConfig config)
         {
             _config = config;
-            // Generate an ephemeral X25519 key pair for ECDH
             var gen = new X25519KeyPairGenerator();
             gen.Init(new X25519KeyGenerationParameters(new SecureRandom()));
             var kp = gen.GenerateKeyPair();
@@ -51,22 +50,21 @@ namespace CloudCast.Services
         }
 
         // ── pair-setup ────────────────────────────────────────────────────────
-        // iOS sends M1 (state=1, method=0). We respond with M2: our Ed25519 public key.
+        // iOS sends M1 (state=1, method=0). We respond with M2: Ed25519 public key.
         public Task<byte[]?> HandlePairSetupAsync(byte[] body)
         {
             var tlv = DecodeTlv8(body);
             tlv.TryGetValue(0x06, out var stateBytes);
-            byte state = stateBytes != null && stateBytes.Length > 0 ? stateBytes[0] : 0;
+            byte state = (stateBytes != null && stateBytes.Length > 0) ? stateBytes[0] : (byte)0;
             System.Diagnostics.Debug.WriteLine($"[HAP] pair-setup state={state}");
 
-            // M1 → respond with M2: our Ed25519 public key wrapped in TLV8
             var response = EncodeTlv8(new Dictionary<byte, byte[]>
             {
-                { 0x06, new byte[] { 0x02 } },          // state = M2
-                { 0x03, _config.Ed25519PublicKey },      // public key
+                { 0x06, new byte[] { 0x02 } },      // state = M2
+                { 0x03, _config.Ed25519PublicKey },  // public key
             });
             System.Diagnostics.Debug.WriteLine(
-                $"[HAP] pair-setup M2 response: {response.Length} bytes, " +
+                $"[HAP] pair-setup M2: {response.Length} bytes, " +
                 $"pk={BitConverter.ToString(_config.Ed25519PublicKey, 0, 4)}…");
             return Task.FromResult<byte[]?>(response);
         }
@@ -76,7 +74,7 @@ namespace CloudCast.Services
         {
             var tlv = DecodeTlv8(body);
             tlv.TryGetValue(0x06, out var stateBytes);
-            byte state = stateBytes != null && stateBytes.Length > 0 ? stateBytes[0] : 0;
+            byte state = (stateBytes != null && stateBytes.Length > 0) ? stateBytes[0] : (byte)0;
             System.Diagnostics.Debug.WriteLine($"[HAP] pair-verify state={state}");
 
             if (state == 1)
@@ -111,7 +109,8 @@ namespace CloudCast.Services
             var agreement = new X25519Agreement();
             agreement.Init(new X25519PrivateKeyParameters(_verifyPrivateKey, 0));
             EcdhSharedSecret = new byte[agreement.AgreementSize];
-            agreement.CalculateAgreement(new X25519PublicKeyParameters(_peerPublicKey, 0), EcdhSharedSecret, 0);
+            agreement.CalculateAgreement(
+                new X25519PublicKeyParameters(_peerPublicKey, 0), EcdhSharedSecret, 0);
 
             System.Diagnostics.Debug.WriteLine(
                 $"[HAP] pair-verify phase 1: ECDH shared={BitConverter.ToString(EcdhSharedSecret, 0, 4)}…");
@@ -120,12 +119,11 @@ namespace CloudCast.Services
             var msgToSign = Concat(_verifyPublicKey, _peerPublicKey);
             var signature = Ed25519Sign(msgToSign, _config.Ed25519PrivateKey);
 
-            // Build M2 response
             var response = EncodeTlv8(new Dictionary<byte, byte[]>
             {
-                { 0x06, new byte[] { 0x02 } },   // state = M2
-                { 0x03, _verifyPublicKey },        // our ephemeral verify public key
-                { 0x09, signature },               // Ed25519 signature
+                { 0x06, new byte[] { 0x02 } }, // state = M2
+                { 0x03, _verifyPublicKey },     // our ephemeral verify public key
+                { 0x09, signature },            // Ed25519 signature
             });
             System.Diagnostics.Debug.WriteLine(
                 $"[HAP] pair-verify phase 1 M2: {response.Length} bytes");
@@ -148,7 +146,7 @@ namespace CloudCast.Services
                 return null;
             }
 
-            // Derive session key: HKDF-SHA-512(shared, salt="Pair-Verify-Encrypt-Salt", info="Pair-Verify-Encrypt-Info") → 32 bytes
+            // Derive session key via HKDF-SHA-512
             byte[] sessionKey = HkdfSha512(
                 EcdhSharedSecret,
                 Encoding.UTF8.GetBytes("Pair-Verify-Encrypt-Salt"),
@@ -158,34 +156,32 @@ namespace CloudCast.Services
             System.Diagnostics.Debug.WriteLine(
                 $"[HAP] pair-verify phase 2: sessionKey={BitConverter.ToString(sessionKey, 0, 4)}…");
 
-            // Decrypt encData using ChaCha20-Poly1305, nonce="PV-Msg03"
-            byte[]? plaintext = ChaCha20Poly1305Decrypt(sessionKey,
-                Encoding.UTF8.GetBytes("PV-Msg03"), encData);
+            // Decrypt using ChaCha20-Poly1305, nonce="PV-Msg03"
+            byte[]? plaintext = ChaCha20Poly1305Decrypt(
+                sessionKey, Encoding.UTF8.GetBytes("PV-Msg03"), encData);
 
             if (plaintext == null)
             {
-                System.Diagnostics.Debug.WriteLine("[HAP] pair-verify phase 2: ChaCha20-Poly1305 decryption failed");
+                System.Diagnostics.Debug.WriteLine(
+                    "[HAP] pair-verify phase 2: ChaCha20-Poly1305 decryption failed");
                 return null;
             }
 
             System.Diagnostics.Debug.WriteLine(
                 $"[HAP] pair-verify phase 2: decrypted {plaintext.Length} bytes");
 
-            // Inner TLV8 contains identifier (0x01) and signature (0x09)
             var inner = DecodeTlv8(plaintext);
             inner.TryGetValue(0x01, out var peerId);
-            inner.TryGetValue(0x09, out var peerSig);
-
             System.Diagnostics.Debug.WriteLine(
                 $"[HAP] pair-verify phase 2: peerId={( peerId != null ? Encoding.UTF8.GetString(peerId) : "null")}");
 
-            // Accept the connection — build M4 response
+            // Respond M4 — pairing complete
             var response = EncodeTlv8(new Dictionary<byte, byte[]>
             {
                 { 0x06, new byte[] { 0x04 } }, // state = M4
             });
             System.Diagnostics.Debug.WriteLine(
-                $"[HAP] pair-verify phase 2 M4: {response.Length} bytes — pairing COMPLETE");
+                $"[HAP] pair-verify M4: {response.Length} bytes — pairing COMPLETE");
             return response;
         }
 
@@ -204,7 +200,7 @@ namespace CloudCast.Services
         {
             try
             {
-                // Pad nonce to 12 bytes (HAP uses 8-byte nonce prepended with 4 zero bytes)
+                // HAP uses an 8-byte nonce, zero-padded to 12 bytes on the left
                 var nonce12 = new byte[12];
                 Array.Copy(nonce, 0, nonce12, 4, Math.Min(nonce.Length, 8));
 
@@ -227,12 +223,10 @@ namespace CloudCast.Services
 
         private static byte[] HkdfSha512(byte[] ikm, byte[] salt, byte[] info, int outputLen)
         {
-            // HKDF-Extract
             using var hmacExtract = new HMACSHA512(salt);
             byte[] prk = hmacExtract.ComputeHash(ikm);
 
-            // HKDF-Expand
-            var output = new List<byte>();
+            var output = new System.Collections.Generic.List<byte>();
             byte[] prev = Array.Empty<byte>();
             byte counter = 1;
             while (output.Count < outputLen)
@@ -251,17 +245,17 @@ namespace CloudCast.Services
 
         internal static byte[] EncodeTlv8(Dictionary<byte, byte[]> items)
         {
-            var result = new List<byte>();
+            var result = new System.Collections.Generic.List<byte>();
             foreach (var kv in items)
             {
-                byte tag = kv.Key;
+                byte tag   = kv.Key;
                 byte[] value = kv.Value;
                 int offset = 0;
                 do
                 {
                     int chunkLen = Math.Min(value.Length - offset, 255);
                     result.Add(tag);
-                    result.Add((byte)chunkLen);
+                    result.Add((byte)chunkLen);  // explicit cast: int → byte
                     result.AddRange(new ArraySegment<byte>(value, offset, chunkLen));
                     offset += chunkLen;
                 } while (offset < value.Length);
@@ -282,7 +276,6 @@ namespace CloudCast.Services
                 i += len;
                 if (result.TryGetValue(tag, out var existing))
                 {
-                    // Concatenate multi-chunk values
                     var merged = new byte[existing.Length + len];
                     existing.CopyTo(merged, 0);
                     chunk.CopyTo(merged, existing.Length);

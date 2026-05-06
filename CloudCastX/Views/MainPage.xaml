@@ -1,0 +1,39 @@
+<Page
+    x:Class="CloudCast.Views.MainPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:CloudCast.Views"
+    Background="Black">
+
+    <Grid>
+        <!-- Full-screen video — hidden until a stream is active -->
+        <MediaPlayerElement x:Name="VideoPlayer"
+                            AreTransportControlsEnabled="False"
+                            Stretch="Uniform"
+                            HorizontalAlignment="Stretch"
+                            VerticalAlignment="Stretch"
+                            Visibility="Collapsed" />
+
+        <!-- Idle / status overlay -->
+        <StackPanel x:Name="StatusPanel"
+                    HorizontalAlignment="Center"
+                    VerticalAlignment="Center"
+                    Spacing="20">
+            <TextBlock Text="CloudCastX"
+                       FontSize="64"
+                       FontWeight="Light"
+                       Foreground="White"
+                       HorizontalAlignment="Center" />
+            <TextBlock x:Name="StatusText"
+                       Text="Starting…"
+                       FontSize="20"
+                       Foreground="#AAFFFFFF"
+                       HorizontalAlignment="Center" />
+            <TextBlock x:Name="ConnectedDeviceText"
+                       FontSize="16"
+                       Foreground="#66FFFFFF"
+                       HorizontalAlignment="Center"
+                       Visibility="Collapsed" />
+        </StackPanel>
+    </Grid>
+</Page>

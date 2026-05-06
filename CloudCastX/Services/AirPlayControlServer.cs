@@ -180,7 +180,7 @@ namespace CloudCast.Services
                     ("POST", "/stream")          => await HandleStreamAsync(req),
                     ("GET",  "/playback-info")   => HandlePlaybackInfo(),
                     ("POST", "/stop")            => HandleStop(),
-                    _                            => HandleSetupOrDefault(req),
+                    _                            => await HandleSetupOrDefaultAsync(req),
                 };
             }
             catch (Exception ex)
@@ -212,7 +212,7 @@ namespace CloudCast.Services
                 ["pk"]                      = pkHex,
                 ["psi"]                     = "00000000-0000-0000-0000-000000000000",
                 ["srcvers"]                 = AirPlayConfig.ServerVersion,
-                // Bug 6 fix: statusFlags=0 — no PIN required for transient pairing.
+                // statusFlags=0: no PIN required for transient pairing.
                 // 0x04 was incorrectly forcing iOS to show a PIN entry dialog.
                 ["statusFlags"]             = (long)0,
                 ["vv"]                      = (long)2,
@@ -246,24 +246,29 @@ namespace CloudCast.Services
                 : HttpResp.Error(403);
         }
 
-        // Handles RTSP SETUP or any unrecognized method. SETUP carries ekey/eiv/streams
-        // in a binary plist body — the same data AirTunes sends before mirroring starts.
-        private HttpResp HandleSetupOrDefault(HttpReq req)
+        // Bug 7 & 8 fix: HandleSetupOrDefaultAsync is now async.
+        // On the first SETUP request, a MirroringSession is created and its UDP
+        // socket is bound immediately (BindUdpAsync). The real OS-assigned port
+        // is then returned to iOS in the dataPort field — previously a hardcoded
+        // constant was returned while the actual socket was bound later during
+        // /stream, so iOS was always sending video to the wrong port.
+        private async Task<HttpResp> HandleSetupOrDefaultAsync(HttpReq req)
         {
             if (req.Body.Length == 0)
                 return HttpResp.Ok(Array.Empty<byte>());
 
             try
             {
-                return HandleSetupPlist(req.Body);
+                return await HandleSetupPlistAsync(req.Body);
             }
-            catch
+            catch (Exception ex)
             {
+                System.Diagnostics.Debug.WriteLine($"[AirPlay] SETUP error: {ex.Message}");
                 return HttpResp.Ok(Array.Empty<byte>());
             }
         }
 
-        private HttpResp HandleSetupPlist(byte[] body)
+        private async Task<HttpResp> HandleSetupPlistAsync(byte[] body)
         {
             var plist = BinaryPlist.Decode(body);
             if (plist == null)
@@ -285,10 +290,15 @@ namespace CloudCast.Services
                 System.Diagnostics.Debug.WriteLine($"[AirPlay] SETUP streamConnectionID: {_streamConnectionId}");
             }
 
-            // Bug 2 & 3 fix: return dedicated ports for timing/event/video.
-            // Previously all three pointed to ControlPort (7000), causing a port
-            // conflict — 7000 is already bound by the StreamSocketListener.
-            // Also add the required 'streams' array so iOS knows where to send video data.
+            // Bug 7 & 8 fix: bind the UDP socket now so we know the real port.
+            // Stop any pre-existing session before creating a new one.
+            _activeSession?.Stop();
+            _activeSession = new MirroringSession(_player);
+            await _activeSession.BindUdpAsync();
+
+            System.Diagnostics.Debug.WriteLine(
+                $"[AirPlay] SETUP: video dataPort = {_activeSession.VideoPort}");
+
             var responseDict = new Dictionary<string, object>
             {
                 ["timingPort"] = (long)AirPlayConfig.TimingPort,
@@ -298,7 +308,8 @@ namespace CloudCast.Services
                     new Dictionary<string, object>
                     {
                         ["type"]     = (long)110,
-                        ["dataPort"] = (long)AirPlayConfig.VideoPort,
+                        // Return the actual bound port, not a hardcoded constant.
+                        ["dataPort"] = (long)_activeSession.VideoPort,
                     }
                 }
             };
@@ -326,8 +337,8 @@ namespace CloudCast.Services
                     _streamConnectionId = scid?.ToString();
             }
 
-            // Bug 5 fix: guard against null KeyMsg — FairPlay phase 2 must have
-            // completed before a mirroring session can decrypt the video stream.
+            // Guard against null KeyMsg — FairPlay phase 2 must have completed
+            // before a mirroring session can decrypt the video stream.
             if (_fp.KeyMsg == null)
             {
                 System.Diagnostics.Debug.WriteLine(
@@ -336,14 +347,21 @@ namespace CloudCast.Services
                 return HttpResp.Error(403);
             }
 
-            _activeSession?.Stop();
-            _activeSession = new MirroringSession(_player);
+            // If SETUP already created and bound the session, reuse it.
+            // Otherwise create a new one (fallback for clients that skip SETUP).
+            if (_activeSession == null)
+            {
+                _activeSession = new MirroringSession(_player);
+                await _activeSession.BindUdpAsync();
+            }
+
             await _activeSession.StartAsync(1920, 1080,
                 _fp.KeyMsg, _encryptedAesKey, _aesIv,
                 _hap.EcdhSharedSecret, _streamConnectionId);
 
             StatusChanged?.Invoke("Connecting…");
 
+            // Return the same port that was already communicated in SETUP.
             var responseDict = new Dictionary<string, object>
             {
                 ["streams"] = new object[]
@@ -390,7 +408,6 @@ namespace CloudCast.Services
 
     // ── Lightweight HTTP message types ────────────────────────────────────────
 
-    // Plain class (not record) for .NET Standard 2.0 / UWP .NET Native compatibility.
     internal class HttpReq
     {
         public string Method  { get; }

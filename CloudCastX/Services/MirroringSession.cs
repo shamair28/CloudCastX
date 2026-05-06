@@ -35,21 +35,36 @@ namespace CloudCast.Services
         private byte[]? _decryptIv;
         private bool _decryptionReady;
 
+        // FU-A reassembly buffer (Bug 9 fix)
+        private List<byte>? _fuaBuffer;
+        private byte _fuaNalHeader;
+
         public ushort VideoPort { get; private set; }
 
         public MirroringSession(MediaPlayerElement player) => _player = player;
+
+        // Bug 7 & 8 fix: Bind the UDP socket early (during SETUP) so VideoPort is
+        // known before /stream is called. iOS commits to the port from the SETUP
+        // response — returning a hardcoded constant meant nothing was listening there.
+        public async Task BindUdpAsync()
+        {
+            if (_rtp != null) return; // already bound
+            _rtp = new DatagramSocket();
+            _rtp.MessageReceived += OnRtpMessage;
+            await _rtp.BindServiceNameAsync("0"); // OS assigns an ephemeral port
+            VideoPort = ushort.Parse(_rtp.Information.LocalPort);
+            System.Diagnostics.Debug.WriteLine($"[Mirroring] UDP socket bound on port {VideoPort}");
+        }
 
         public async Task StartAsync(uint width, uint height,
             byte[]? keyMsg = null, byte[]? encryptedAesKey = null,
             byte[]? aesIv = null, byte[]? ecdhShared = null,
             string? streamConnectionId = null)
         {
-            await InitDecryptionAsync(keyMsg, encryptedAesKey, aesIv, ecdhShared, streamConnectionId);
+            // Ensure UDP is bound (may have already been bound during SETUP)
+            await BindUdpAsync();
 
-            _rtp = new DatagramSocket();
-            _rtp.MessageReceived += OnRtpMessage;
-            await _rtp.BindServiceNameAsync("0");
-            VideoPort = ushort.Parse(_rtp.Information.LocalPort);
+            await InitDecryptionAsync(keyMsg, encryptedAesKey, aesIv, ecdhShared, streamConnectionId);
 
             var videoProps = VideoEncodingProperties.CreateH264();
             videoProps.Width  = width;
@@ -115,7 +130,9 @@ namespace CloudCast.Services
             _cts.Cancel();
             _player.Source = null;
             _rtp?.Dispose();
+            _rtp = null;
             _mss = null;
+            VideoPort = 0;
         }
 
         // ── MediaStreamSource callbacks ───────────────────────────────────────
@@ -243,7 +260,11 @@ namespace CloudCast.Services
 
         // ── RFC 6184 H.264 RTP payload parsing ───────────────────────────────
 
-        private static IEnumerable<byte[]> ParseNalus(byte[] payload)
+        // Bug 9 fix: FU-A (naluType==28) fragments must be reassembled before
+        // yielding. Previously only the start fragment was yielded and all
+        // continuation/end fragments were silently dropped, corrupting every
+        // fragmented NALU and stalling the MediaStreamSource decoder.
+        private IEnumerable<byte[]> ParseNalus(byte[] payload)
         {
             if (payload.Length == 0) yield break;
 
@@ -251,10 +272,12 @@ namespace CloudCast.Services
 
             if (naluType >= 1 && naluType <= 23)
             {
+                // Single NAL unit packet
                 yield return payload;
             }
             else if (naluType == 24)
             {
+                // STAP-A: multiple NALUs in one RTP packet
                 int i = 1;
                 while (i + 2 <= payload.Length)
                 {
@@ -269,16 +292,33 @@ namespace CloudCast.Services
             }
             else if (naluType == 28)
             {
-                byte fuHeader = payload[1];
-                bool start = (fuHeader & 0x80) != 0;
-                byte nal1  = (byte)((payload[0] & 0xE0) | (fuHeader & 0x1F));
+                // FU-A: fragmented NALU — must reassemble across multiple RTP packets
+                if (payload.Length < 2) yield break;
 
-                if (start)
+                byte fuHeader  = payload[1];
+                bool isStart   = (fuHeader & 0x80) != 0;
+                bool isEnd     = (fuHeader & 0x40) != 0;
+                byte nalHeader = (byte)((payload[0] & 0xE0) | (fuHeader & 0x1F));
+
+                if (isStart)
                 {
-                    var frag = new byte[1 + payload.Length - 2];
-                    frag[0] = nal1;
-                    SysBuffer.BlockCopy(payload, 2, frag, 1, payload.Length - 2);
-                    yield return frag;
+                    // Begin a new reassembly buffer; prepend the reconstructed NAL header
+                    _fuaBuffer = new List<byte>();
+                    _fuaNalHeader = nalHeader;
+                    _fuaBuffer.Add(nalHeader);
+                    _fuaBuffer.AddRange(new ArraySegment<byte>(payload, 2, payload.Length - 2));
+                }
+                else if (_fuaBuffer != null)
+                {
+                    // Continuation or end fragment — append payload data (skip FU indicator + FU header)
+                    _fuaBuffer.AddRange(new ArraySegment<byte>(payload, 2, payload.Length - 2));
+                }
+
+                if (isEnd && _fuaBuffer != null)
+                {
+                    // Reassembly complete — yield the full NALU and clear the buffer
+                    yield return _fuaBuffer.ToArray();
+                    _fuaBuffer = null;
                 }
             }
         }
@@ -309,7 +349,7 @@ namespace CloudCast.Services
             return result;
         }
 
-        private static uint   ReadUInt32(DataReader dr) =>
+        private static uint ReadUInt32(DataReader dr) =>
             ((uint)dr.ReadByte() << 24) | ((uint)dr.ReadByte() << 16) |
             ((uint)dr.ReadByte() << 8)  |  dr.ReadByte();
 

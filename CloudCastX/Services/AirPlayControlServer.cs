@@ -27,6 +27,7 @@ namespace CloudCast.Services
         private string? _streamConnectionId;
         private ushort _clientTimingPort;
         private string? _clientAddress;
+        private bool _sessionActive; // set after initial SETUP — changes statusFlags in /info
 
         public event Action<string>? StatusChanged;
         public event Action<string>? StreamingStarted;
@@ -230,7 +231,7 @@ namespace CloudCast.Services
                 ["pk"]                      = _config.Ed25519PublicKey,
                 ["psi"]                     = "00000000-0000-0000-0000-000000000000",
                 ["srcvers"]                 = AirPlayConfig.ServerVersion,
-                ["statusFlags"]             = (long)0x04,
+                ["statusFlags"]             = (long)(_sessionActive ? 0x20004 : 0x04),
                 ["vv"]                      = (long)2,
 
                 // Display capabilities — required for iOS to know mirroring resolution
@@ -291,7 +292,7 @@ namespace CloudCast.Services
             };
 
             System.Diagnostics.Debug.WriteLine(
-                $"[AirPlay] /info: statusFlags=0x04 (transient), " +
+                $"[AirPlay] /info: statusFlags=0x{(_sessionActive ? 0x20004 : 0x04):X} ({(_sessionActive ? "active" : "transient")}), " +
                 $"features=0x{AirPlayConfig.Features:X}, " +
                 $"pk={BitConverter.ToString(_config.Ed25519PublicKey, 0, 4)}…");
 
@@ -386,15 +387,26 @@ namespace CloudCast.Services
             await EnsureEventSocketAsync();
             await EnsureTimingSocketAsync();
 
+            ushort timingPort = GetTimingPort();
+            _sessionActive = true;
+
             System.Diagnostics.Debug.WriteLine(
-                $"[AirPlay] SETUP initial: returning empty 200 OK (sockets ready: event={_eventPort} timing={GetTimingPort()})");
+                $"[AirPlay] SETUP initial: eventPort={_eventPort} timingPort={timingPort}");
 
-            // Start NTP timing immediately (fire-and-forget, no delay)
-            _ = StartNtpTimingAsync();
+            // Start NTP timing after a brief delay so SETUP response arrives first
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(100);
+                await StartNtpTimingAsync();
+            });
 
-            // Wire capture shows initial SETUP response is Content-Length: 0.
-            // eventPort/timingPort are returned in the stream SETUP response (CSeq 10).
-            return HttpResp.Ok(Array.Empty<byte>());
+            // Spec text says initial SETUP response includes eventPort and timingPort
+            var responseDict = new Dictionary<string, object>
+            {
+                ["eventPort"]  = (long)_eventPort,
+                ["timingPort"] = (long)timingPort,
+            };
+            return HttpResp.Ok(BinaryPlist.Encode(responseDict), "application/x-apple-binary-plist");
         }
 
         // Phase 2: Stream SETUP — parse the streams array, bind ports, echo type back.

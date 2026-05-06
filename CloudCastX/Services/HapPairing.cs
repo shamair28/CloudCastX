@@ -51,11 +51,11 @@ namespace CloudCast.Services
             byte state = (stateBytes != null && stateBytes.Length > 0) ? stateBytes[0] : (byte)0;
             System.Diagnostics.Debug.WriteLine($"[HAP] pair-setup received state={state}");
 
-            // Only respond to M1 (state=1). Any other state is a protocol error.
-            if (state != 1)
+            // Respond to M1 (state=1) or transient probe (state=0, empty body).
+            if (state != 1 && state != 0)
             {
                 System.Diagnostics.Debug.WriteLine(
-                    $"[HAP] pair-setup: unexpected state {state}, expected 1 (M1) — rejecting");
+                    $"[HAP] pair-setup: unexpected state {state}, expected 0 or 1 — rejecting");
                 return Task.FromResult<byte[]?>(null);
             }
 

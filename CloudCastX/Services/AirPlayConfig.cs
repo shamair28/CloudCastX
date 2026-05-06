@@ -14,10 +14,7 @@ namespace CloudCast.Services
         public const string Model         = "AppleTV5,3";
         public const string ServerVersion = "220.68";
 
-        public const ushort ControlPort = 7000;
-        public const ushort TimingPort  = 7001;
-        public const ushort EventPort   = 7002;
-        public const ushort VideoPort   = 7100;
+        public const ushort ControlPort = 7000;  // also used as timingPort + eventPort in SETUP responses
         public const ushort RaopPort    = 5000;
 
         // Features bitmask — Option A: Transient pairing (no PIN)

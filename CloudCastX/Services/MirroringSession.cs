@@ -79,7 +79,10 @@ namespace CloudCast.Services
             _mss.Starting        += OnStarting;
             _mss.SampleRequested += OnSampleRequested;
 
-            _player.Source = MediaSource.CreateFromMediaStreamSource(_mss);
+            await _player.Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
+            {
+                _player.Source = MediaSource.CreateFromMediaStreamSource(_mss);
+            });
         }
 
         private async Task InitDecryptionAsync(
@@ -125,10 +128,15 @@ namespace CloudCast.Services
             }
         }
 
-        public void Stop()
+        public async Task StopAsync()
         {
             _cts.Cancel();
-            _player.Source = null;
+            try
+            {
+                await _player.Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
+                    _player.Source = null);
+            }
+            catch { /* dispatcher may be gone during shutdown */ }
             _rtp?.Dispose();
             _rtp = null;
             _mss = null;

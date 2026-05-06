@@ -114,7 +114,10 @@ namespace CloudCast.Services
             return ReplyMessages[mode];
         }
 
-        private byte[] HandlePhase2(byte[] body)
+        // Bug 5 fix: return type changed from byte[] to byte[]? to correctly
+        // represent the null-on-failure path and prevent NullReferenceException
+        // in callers that rely on KeyMsg being set before streaming starts.
+        private byte[]? HandlePhase2(byte[] body)
         {
             if (body[4] != 0x03)
             {

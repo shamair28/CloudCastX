@@ -212,7 +212,9 @@ namespace CloudCast.Services
                 ["pk"]                      = pkHex,
                 ["psi"]                     = "00000000-0000-0000-0000-000000000000",
                 ["srcvers"]                 = AirPlayConfig.ServerVersion,
-                ["statusFlags"]             = (long)4,
+                // Bug 6 fix: statusFlags=0 — no PIN required for transient pairing.
+                // 0x04 was incorrectly forcing iOS to show a PIN entry dialog.
+                ["statusFlags"]             = (long)0,
                 ["vv"]                      = (long)2,
             };
 
@@ -283,11 +285,22 @@ namespace CloudCast.Services
                 System.Diagnostics.Debug.WriteLine($"[AirPlay] SETUP streamConnectionID: {_streamConnectionId}");
             }
 
-            // Return timingPort/eventPort response
+            // Bug 2 & 3 fix: return dedicated ports for timing/event/video.
+            // Previously all three pointed to ControlPort (7000), causing a port
+            // conflict — 7000 is already bound by the StreamSocketListener.
+            // Also add the required 'streams' array so iOS knows where to send video data.
             var responseDict = new Dictionary<string, object>
             {
-                ["timingPort"] = (long)AirPlayConfig.ControlPort,
-                ["eventPort"]  = (long)AirPlayConfig.ControlPort,
+                ["timingPort"] = (long)AirPlayConfig.TimingPort,
+                ["eventPort"]  = (long)AirPlayConfig.EventPort,
+                ["streams"] = new object[]
+                {
+                    new Dictionary<string, object>
+                    {
+                        ["type"]     = (long)110,
+                        ["dataPort"] = (long)AirPlayConfig.VideoPort,
+                    }
+                }
             };
             return HttpResp.Ok(BinaryPlist.Encode(responseDict), "application/x-apple-binary-plist");
         }
@@ -311,6 +324,16 @@ namespace CloudCast.Services
                     _aesIv = eiv;
                 if (plist.TryGetValue("streamConnectionID", out var scid))
                     _streamConnectionId = scid?.ToString();
+            }
+
+            // Bug 5 fix: guard against null KeyMsg — FairPlay phase 2 must have
+            // completed before a mirroring session can decrypt the video stream.
+            if (_fp.KeyMsg == null)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    "[AirPlay] /stream: FairPlay key exchange not complete — KeyMsg is null");
+                StatusChanged?.Invoke("FairPlay key exchange incomplete.");
+                return HttpResp.Error(403);
             }
 
             _activeSession?.Stop();

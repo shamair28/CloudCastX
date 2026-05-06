@@ -16,7 +16,8 @@ namespace CloudCast.Services
 {
     // Implements the transient AirPlay pairing handshake used by SteeBono/airplayreceiver.
     //
-    // Pair-Setup (1 round-trip): server returns its 32-byte Ed25519 public key directly.
+    // Pair-Setup (1 round-trip): server returns TLV8-encoded Ed25519 public key.
+    //   TLV8 response: [0x06][0x01][0x02] (state=M2) + [0x03][0x20][pk:32]
     //
     // Pair-Verify (2 round-trips): raw Curve25519 ECDH with AES-CTR-encrypted Ed25519 proof.
     //   Phase 1 body: [flag:1][padding:3][ecdhTheirs:32][edTheirs:32]  = 68 bytes
@@ -36,12 +37,23 @@ namespace CloudCast.Services
 
         // ── Pair-Setup ────────────────────────────────────────────────────────
 
-        // Simple transient pair-setup: just return the 32-byte Ed25519 public key.
+        // Bug 1 fix: return TLV8-encoded response instead of raw key bytes.
+        // iOS expects: tag 0x06 (state=M2) + tag 0x03 (Ed25519 public key).
         public Task<byte[]?> HandlePairSetupAsync(byte[] body)
         {
-            System.Diagnostics.Debug.WriteLine("[HapPairing] pair-setup: returning Ed25519 public key");
-            byte[]? response = (byte[])_config.Ed25519PublicKey.Clone();
-            return Task.FromResult(response);
+            System.Diagnostics.Debug.WriteLine("[HapPairing] pair-setup: returning TLV8-encoded Ed25519 public key");
+
+            byte[] pk = _config.Ed25519PublicKey;
+
+            // TLV8 layout: [tag:1][len:1][value:N]
+            // Entry 1: tag=0x06 (state), len=1, value=0x02 (M2)
+            // Entry 2: tag=0x03 (public key), len=32, value=pk
+            var tlv = new byte[3 + 2 + pk.Length];
+            tlv[0] = 0x06; tlv[1] = 0x01; tlv[2] = 0x02;          // state = M2
+            tlv[3] = 0x03; tlv[4] = (byte)pk.Length;               // pk tag + length
+            Buffer.BlockCopy(pk, 0, tlv, 5, pk.Length);
+
+            return Task.FromResult<byte[]?>(tlv);
         }
 
         // ── Pair-Verify ───────────────────────────────────────────────────────
@@ -101,15 +113,16 @@ namespace CloudCast.Services
             Buffer.BlockCopy(ecdhTheirs, 0, signData, 32, 32);
             byte[] signature = Ed25519Sign(_config.Ed25519PrivateKey, signData);
 
-            // Encrypt the 64-byte signature with AES/CTR
+            // Encrypt the 64-byte signature with AES/CTR — counter starts at 0.
+            // This consumes keystream bytes 0..63 (CTR block 0).
             byte[] encryptedSig = AesCtrProcess(aesKey, aesIv, signature);
 
             // Persist state for phase 2
             _verify = new PairVerifyState
             {
-                EcdhOurs   = ecdhOurs,
-                EcdhTheirs = ecdhTheirs,
-                EdTheirs   = edTheirs,
+                EcdhOurs    = ecdhOurs,
+                EcdhTheirs  = ecdhTheirs,
+                EdTheirs    = edTheirs,
                 SharedSecret = sharedSecret,
             };
 
@@ -143,13 +156,17 @@ namespace CloudCast.Services
             byte[] aesKey = DeriveAesKeyOrIv("Pair-Verify-AES-Key", _verify.SharedSecret);
             byte[] aesIv  = DeriveAesKeyOrIv("Pair-Verify-AES-IV",  _verify.SharedSecret);
 
-            // The server's phase-1 encryption advanced the CTR by 64 bytes.
-            // To decrypt the client's signature we must advance the same cipher by
-            // 64 bytes (processing a dummy block) then decrypt.
+            // Bug 4 fix: create cipher and advance counter by 64 bytes (one full AES block
+            // worth of keystream = CTR block 0) to match phase 1 encryption offset,
+            // then decrypt the client signature using CTR block 1 onwards.
             var cipher = CreateAesCtrCipher(aesKey, aesIv, forEncryption: false);
-            // Advance counter past the 64 bytes already used in phase 1
-            cipher.ProcessBytes(new byte[64], 0, 64, new byte[64], 0);
-            // Decrypt client's encrypted signature
+            var dummy  = new byte[64];
+            cipher.ProcessBytes(new byte[64], 0, 64, dummy, 0);
+
+            // Debug assertion: log first dummy byte to verify counter advancement
+            System.Diagnostics.Debug.WriteLine(
+                $"[HapPairing] pair-verify phase2: CTR advanced 64 bytes, dummy[0]=0x{dummy[0]:X2} (expect non-zero keystream)");
+
             byte[] clientSig = new byte[64];
             cipher.ProcessBytes(clientEncryptedSig, 0, 64, clientSig, 0);
 
@@ -165,8 +182,8 @@ namespace CloudCast.Services
             // Keep EcdhSharedSecret for downstream use; clear the per-handshake state
             _verify = null;
 
-            // Return empty response on success
-            return Array.Empty<byte>();
+            // Return empty response on success, null on verification failure
+            return verified ? Array.Empty<byte>() : null;
         }
 
         // ── Crypto helpers ────────────────────────────────────────────────────

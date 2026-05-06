@@ -16,7 +16,12 @@ namespace CloudCast.Services
 
         public const string Model          = "AppleTV5,3";
         public const string ServerVersion  = "220.68";
+
+        // Bug 3 fix: separate ports to avoid bind conflicts.
         public const ushort ControlPort    = 7000;
+        public const ushort TimingPort     = 7001;  // NTP timing sync channel
+        public const ushort EventPort      = 7002;  // AirPlay event channel
+        public const ushort VideoPort      = 7100;  // mirroring video data
         public const ushort RaopPort       = 5000;
 
         // Features bitmask advertised to Apple devices (matches known-working values

@@ -7,35 +7,27 @@ using Windows.Storage;
 
 namespace CloudCast.Services
 {
-    // Holds device identity and cryptographic keys that persist across app sessions.
-    // Keys are stored in ApplicationData.LocalSettings so paired Apple devices don't
-    // need to re-pair after an app restart.
     internal class AirPlayConfig
     {
         // ── Protocol constants ─────────────────────────────────────────────────
 
-        public const string Model          = "AppleTV5,3";
-        public const string ServerVersion  = "220.68";
+        public const string Model         = "AppleTV5,3";
+        public const string ServerVersion = "220.68";
 
-        public const ushort ControlPort    = 7000;
-        public const ushort TimingPort     = 7001;
-        public const ushort EventPort      = 7002;
-        public const ushort VideoPort      = 7100;
-        public const ushort RaopPort       = 5000;
+        public const ushort ControlPort = 7000;
+        public const ushort TimingPort  = 7001;
+        public const ushort EventPort   = 7002;
+        public const ushort VideoPort   = 7100;
+        public const ushort RaopPort    = 5000;
 
         // Features bitmask — Option A: Transient pairing (no PIN)
-        //
-        // Authentication4 is bit 3 of the low dword (0x00000008).
-        // Setting it forces iOS into HAP PIN pairing mode.
-        // Clearing it enables transient pairing: iOS connects instantly
-        // with no on-screen PIN required, identical to RPiPlay / UxPlay behaviour.
-        //
-        // Before: 0x0E4A7FFFF7  (Authentication4 SET   → PIN required)
-        //  After: 0x0E4A7FFFEF  (Authentication4 CLEAR → transient pairing)
+        // Authentication4 (bit 3, 0x8) cleared → iOS uses transient pairing, no PIN prompt.
+        // Before: 0x0E4A7FFFF7  (bit 3 SET   → PIN required)
+        //  After: 0x0E4A7FFFEF  (bit 3 CLEAR → transient, no PIN)
         public const string FeaturesHex = "0x4A7FFFEF,0x0E";
-        public const long   Features    = unchecked((long)0x0E4A7FFFEF L);
+        public const long   Features    = unchecked((long)0x0E4A7FFFEF);
 
-        // ── Instance identity ────────────────────────────────────────────────
+        // ── Instance identity ──────────────────────────────────────────────────
 
         public string DeviceName    { get; private set; } = "CloudCastXTest";
         public string DeviceId      { get; private set; } = string.Empty;
@@ -76,7 +68,7 @@ namespace CloudCast.Services
             return cfg;
         }
 
-        // ── Helpers ────────────────────────────────────────────────────────────
+        // ── Helpers ───────────────────────────────────────────────────────────
 
         private static string GenerateMac()
         {

@@ -19,7 +19,7 @@ namespace CloudCast.Services
         private MirroringSession? _activeSession;
         private DatagramSocket? _audioSocket;
         private DatagramSocket? _timingSocket;
-        private DatagramSocket? _eventSocket;
+        private StreamSocketListener? _eventListener;
         private ushort _eventPort;
 
         private byte[]? _encryptedAesKey;
@@ -202,6 +202,8 @@ namespace CloudCast.Services
                     ("POST", "/stream")          => await HandleStreamAsync(req),
                     ("GET",  "/playback-info")   => HandlePlaybackInfo(),
                     ("POST", "/stop")            => await HandleStop(),
+                    ("RECORD", _)               => HandleRecord(req),
+                    ("SETPEERS", _)             => HandleSetPeers(req),
                     _                            => await HandleSetupOrDefaultAsync(req),
                 };
             }
@@ -324,6 +326,18 @@ namespace CloudCast.Services
                 : HttpResp.Error(403);
         }
 
+        private HttpResp HandleRecord(HttpReq req)
+        {
+            System.Diagnostics.Debug.WriteLine("[AirPlay] RECORD — streaming initiated");
+            return HttpResp.Ok(Array.Empty<byte>());
+        }
+
+        private HttpResp HandleSetPeers(HttpReq req)
+        {
+            System.Diagnostics.Debug.WriteLine($"[AirPlay] SETPEERS — {req.Body.Length} bytes");
+            return HttpResp.Ok(Array.Empty<byte>());
+        }
+
         private async Task<HttpResp> HandleSetupOrDefaultAsync(HttpReq req)
         {
             if (req.Body.Length == 0)
@@ -378,23 +392,28 @@ namespace CloudCast.Services
                 return await HandleInitialSetupAsync();
         }
 
-        // Phase 1: Initial SETUP — store ekey/eiv, bind sockets, return empty 200 OK.
-        // Samsung TV wire capture shows Content-Length: 0 for the initial SETUP.
-        // eventPort/timingPort go in the stream SETUP response.
-        // Returning a plist here causes iOS to reject immediately (faster failure).
         private async Task<HttpResp> HandleInitialSetupAsync()
         {
             await EnsureEventSocketAsync();
             await EnsureTimingSocketAsync();
             _sessionActive = true;
 
-            System.Diagnostics.Debug.WriteLine(
-                $"[AirPlay] SETUP initial: empty 200 OK (session active, event={_eventPort} timing={GetTimingPort()})");
+            ushort timingPort = GetTimingPort();
 
-            // Start NTP timing immediately (fire-and-forget)
+            System.Diagnostics.Debug.WriteLine(
+                $"[AirPlay] SETUP initial: eventPort(TCP)={_eventPort} timingPort(UDP)={timingPort}");
+
+            // Start NTP timing (fire-and-forget)
             _ = StartNtpTimingAsync();
 
-            return HttpResp.Ok(Array.Empty<byte>());
+            // Build response per emanuelecozzi.net spec:
+            // eventPort (TCP), timingPort (UDP), timingPeerInfo
+            var responseDict = new Dictionary<string, object>
+            {
+                ["eventPort"]  = (long)_eventPort,
+                ["timingPort"] = (long)timingPort,
+            };
+            return HttpResp.Ok(BinaryPlist.Encode(responseDict), "application/x-apple-binary-plist");
         }
 
         // Phase 2: Stream SETUP — parse the streams array, bind ports, echo type back.
@@ -541,8 +560,8 @@ namespace CloudCast.Services
             _audioSocket = null;
             _timingSocket?.Dispose();
             _timingSocket = null;
-            _eventSocket?.Dispose();
-            _eventSocket = null;
+            _eventListener?.Dispose();
+            _eventListener = null;
             StreamingStopped?.Invoke();
             return HttpResp.Ok(Array.Empty<byte>());
         }
@@ -551,20 +570,36 @@ namespace CloudCast.Services
 
         private async Task EnsureEventSocketAsync()
         {
-            if (_eventSocket != null) return;
-            _eventSocket = new DatagramSocket();
-            _eventSocket.MessageReceived += (s, e) =>
+            if (_eventListener != null) return;
+            _eventListener = new StreamSocketListener();
+            _eventListener.ConnectionReceived += OnEventConnectionReceived;
+            await _eventListener.BindServiceNameAsync("0");
+            _eventPort = ushort.Parse(_eventListener.Information.LocalPort);
+            System.Diagnostics.Debug.WriteLine($"[AirPlay] Event TCP listener bound on port {_eventPort}");
+        }
+
+        private async void OnEventConnectionReceived(StreamSocketListener sender,
+            StreamSocketListenerConnectionReceivedEventArgs args)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"[AirPlay] Event connection from {args.Socket.Information.RemoteAddress.DisplayName}");
+            // Keep the connection alive — iOS uses this for event delivery
+            try
             {
-                using var reader = e.GetDataReader();
-                uint len = reader.UnconsumedBufferLength;
-                byte[] data = new byte[len];
-                reader.ReadBytes(data);
-                System.Diagnostics.Debug.WriteLine(
-                    $"[AirPlay] Event received: {len} bytes [{BitConverter.ToString(data, 0, Math.Min((int)len, 32))}]");
-            };
-            await _eventSocket.BindServiceNameAsync("0");
-            _eventPort = ushort.Parse(_eventSocket.Information.LocalPort);
-            System.Diagnostics.Debug.WriteLine($"[AirPlay] Event socket bound on port {_eventPort}");
+                using var socket = args.Socket;
+                var reader = new DataReader(socket.InputStream) { InputStreamOptions = InputStreamOptions.Partial };
+                while (true)
+                {
+                    uint loaded = await reader.LoadAsync(4096);
+                    if (loaded == 0) break;
+                    byte[] data = new byte[loaded];
+                    reader.ReadBytes(data);
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[AirPlay] Event data: {loaded} bytes [{BitConverter.ToString(data, 0, Math.Min((int)loaded, 32))}]");
+                }
+            }
+            catch { }
+            System.Diagnostics.Debug.WriteLine("[AirPlay] Event connection closed");
         }
 
         private async Task EnsureTimingSocketAsync()

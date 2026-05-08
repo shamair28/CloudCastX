@@ -394,24 +394,24 @@ namespace CloudCast.Services
 
         private async Task<HttpResp> HandleInitialSetupAsync()
         {
-            await EnsureEventSocketAsync();
+            // Bind timing socket for NTP (still needed for sending timing packets)
             await EnsureTimingSocketAsync();
             _sessionActive = true;
 
-            ushort timingPort = GetTimingPort();
+            // SteeBono returns the SAME control port for both eventPort and timingPort.
+            // No separate event/timing sockets — all traffic goes through port 7000.
+            long port = AirPlayConfig.ControlPort;
 
             System.Diagnostics.Debug.WriteLine(
-                $"[AirPlay] SETUP initial: eventPort(TCP)={_eventPort} timingPort(UDP)={timingPort}");
+                $"[AirPlay] SETUP initial: eventPort={port} timingPort={port} (control port)");
 
             // Start NTP timing (fire-and-forget)
             _ = StartNtpTimingAsync();
 
-            // Build response per emanuelecozzi.net spec:
-            // eventPort (TCP), timingPort (UDP), timingPeerInfo
             var responseDict = new Dictionary<string, object>
             {
-                ["eventPort"]  = (long)_eventPort,
-                ["timingPort"] = (long)timingPort,
+                ["eventPort"]  = port,
+                ["timingPort"] = port,
             };
             return HttpResp.Ok(BinaryPlist.Encode(responseDict), "application/x-apple-binary-plist");
         }

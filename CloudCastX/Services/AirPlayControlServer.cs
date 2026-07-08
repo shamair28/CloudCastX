@@ -18,6 +18,8 @@ namespace CloudCast.Services
         private StreamSocketListener? _listener;
         private MirroringSession? _activeSession;
         private DatagramSocket? _audioSocket;
+        private DatagramSocket? _videoControlSocket;
+        private DatagramSocket? _audioControlSocket;
         private DatagramSocket? _timingSocket;
         private StreamSocketListener? _eventListener;
         private ushort _eventPort;
@@ -27,7 +29,7 @@ namespace CloudCast.Services
         private string? _streamConnectionId;
         private ushort _clientTimingPort;
         private string? _clientAddress;
-        private bool _sessionActive; // set after initial SETUP — changes statusFlags in /info
+        private string? _localAddress; // receiver's own IP on this connection (for PTP timingPeerInfo)
 
         public event Action<string>? StatusChanged;
         public event Action<string>? StreamingStarted;
@@ -62,7 +64,11 @@ namespace CloudCast.Services
             {
                 using var socket = args.Socket;
                 _clientAddress = socket.Information.RemoteAddress.DisplayName;
-                System.Diagnostics.Debug.WriteLine($"[AirPlay] Connection from {_clientAddress}");
+                // Capture the receiver's own address on this connection — needed for
+                // the PTP timingPeerInfo we return in SETUP #1.
+                try { _localAddress = socket.Information.LocalAddress?.DisplayName; } catch { }
+                System.Diagnostics.Debug.WriteLine(
+                    $"[AirPlay] Connection from {_clientAddress} (local {_localAddress})");
 
                 while (true)
                 {
@@ -217,9 +223,11 @@ namespace CloudCast.Services
         private HttpResp HandleInfo()
         {
             // pk must be raw bytes (binary plist DATA type 0x4x).
-            // statusFlags=0x04 = transient pairing supported.
-            //   0x00 would mean "already paired" which iOS rejects on first contact.
-            //   0x04 means "I support transient pairing, no PIN needed".
+            // statusFlags=0x04 = transient pairing supported, no PIN needed.
+            // This value is kept CONSTANT for the lifetime of the receiver. The
+            // sender issues a second GET /info mid-handshake; changing statusFlags
+            // between the two responses (e.g. flipping bit 17) can make iOS believe
+            // a password is now required and abort with "Unable to connect".
             var dict = new Dictionary<string, object>
             {
                 ["deviceID"]                = _config.DeviceId,
@@ -233,7 +241,7 @@ namespace CloudCast.Services
                 ["pk"]                      = _config.Ed25519PublicKey,
                 ["psi"]                     = "00000000-0000-0000-0000-000000000000",
                 ["srcvers"]                 = AirPlayConfig.ServerVersion,
-                ["statusFlags"]             = (long)(_sessionActive ? 0x20004 : 0x04),
+                ["statusFlags"]             = (long)0x04,
                 ["vv"]                      = (long)2,
 
                 // Display capabilities — required for iOS to know mirroring resolution
@@ -294,7 +302,7 @@ namespace CloudCast.Services
             };
 
             System.Diagnostics.Debug.WriteLine(
-                $"[AirPlay] /info: statusFlags=0x{(_sessionActive ? 0x20004 : 0x04):X} ({(_sessionActive ? "active" : "transient")}), " +
+                $"[AirPlay] /info: statusFlags=0x04 (transient), " +
                 $"features=0x{AirPlayConfig.Features:X}, " +
                 $"pk={BitConverter.ToString(_config.Ed25519PublicKey, 0, 4)}…");
 
@@ -389,39 +397,80 @@ namespace CloudCast.Services
             if (plist.ContainsKey("streams"))
                 return await HandleStreamSetupAsync(plist);
             else
-                return await HandleInitialSetupAsync();
+                return await HandleInitialSetupAsync(plist);
         }
 
-        private async Task<HttpResp> HandleInitialSetupAsync()
+        // SETUP #1 — "info and event" per the AirPlay 2 RTSP spec.
+        // The sender sends generic device info, encryption keys (ekey/eiv) and the
+        // timing protocol it wants to use. The receiver must:
+        //   • open a DEDICATED event TCP channel and return its port in `eventPort`
+        //     (the RTSP flow will NOT continue until this channel is established), and
+        //   • declare its timing: for PTP return timingPort=0 + timingPeerInfo; for
+        //     legacy NTP open a UDP timing socket and return its port.
+        // Ref: https://emanuelecozzi.net/docs/airplay2/rtsp/  (SETUP → 1) info and event)
+        private async Task<HttpResp> HandleInitialSetupAsync(Dictionary<string, object> plist)
         {
-            // Bind timing socket for NTP (still needed for sending timing packets)
-            await EnsureTimingSocketAsync();
-            _sessionActive = true;
+            // Modern senders (iOS 12+/macOS) negotiate PTP; only legacy senders use NTP.
+            string timingProtocol = "PTP";
+            if (plist.TryGetValue("timingProtocol", out var tpProto) &&
+                tpProto is string proto && !string.IsNullOrEmpty(proto))
+                timingProtocol = proto;
 
-            // SteeBono returns the SAME control port for both eventPort and timingPort.
-            // No separate event/timing sockets — all traffic goes through port 7000.
-            long port = AirPlayConfig.ControlPort;
+            bool useNtp = timingProtocol.Equals("NTP", StringComparison.OrdinalIgnoreCase);
 
-            System.Diagnostics.Debug.WriteLine(
-                $"[AirPlay] SETUP initial: eventPort={port} timingPort={port} (control port)");
+            // The event channel MUST be a dedicated TCP listener on its own port.
+            // Previously this returned the control port (7000), so iOS opened its
+            // event connection straight into the RTSP server and the handshake stalled.
+            await EnsureEventSocketAsync();
 
-            // Start NTP timing (fire-and-forget)
-            _ = StartNtpTimingAsync();
+            long timingPort;
+            if (useNtp)
+            {
+                await EnsureTimingSocketAsync();
+                timingPort = GetTimingPort();
+                _ = StartNtpTimingAsync(); // legacy senders expect us to drive NTP
+                System.Diagnostics.Debug.WriteLine(
+                    $"[AirPlay] SETUP #1 (NTP): eventPort={_eventPort} timingPort={timingPort}");
+            }
+            else
+            {
+                // PTP: the receiver declares PTP by returning timingPort=0. Timing
+                // sync then happens out-of-band over PTP; no UDP timing socket is used.
+                timingPort = 0;
+                System.Diagnostics.Debug.WriteLine(
+                    $"[AirPlay] SETUP #1 (PTP): eventPort={_eventPort} timingPort=0");
+            }
 
             var responseDict = new Dictionary<string, object>
             {
-                ["eventPort"]  = port,
-                ["timingPort"] = port,
+                ["eventPort"]  = (long)_eventPort,
+                ["timingPort"] = timingPort,
             };
+
+            // For PTP, announce ourselves as a timing peer so the sender can locate us.
+            if (!useNtp && !string.IsNullOrEmpty(_localAddress))
+            {
+                responseDict["timingPeerInfo"] = new Dictionary<string, object>
+                {
+                    ["Addresses"] = new object[] { _localAddress! },
+                    ["ID"]        = _localAddress!,
+                };
+            }
+
             return HttpResp.Ok(BinaryPlist.Encode(responseDict), "application/x-apple-binary-plist");
         }
 
-        // Phase 2: Stream SETUP — parse the streams array, bind ports, echo type back.
-        // Response includes eventPort + timingPort (real UDP) alongside the streams array.
+        // SETUP #2 — "control and data" per the AirPlay 2 RTSP spec.
+        // The sender declares one or more streams (screen=110, audio=96/103, …).
+        // The receiver binds a UDP data channel (RTP payload) and a UDP control
+        // channel (RTCP) for each stream and echoes back, per stream:
+        //     { type, dataPort, controlPort }
+        // NOTE: eventPort/timingPort belong ONLY to SETUP #1 and must NOT be
+        // repeated here — doing so previously made iOS reopen its event/timing
+        // channels against stale ports.
+        // Ref: https://emanuelecozzi.net/docs/airplay2/rtsp/  (SETUP → 2) control and data)
         private async Task<HttpResp> HandleStreamSetupAsync(Dictionary<string, object> plist)
         {
-            await EnsureEventSocketAsync();
-
             long streamType = 110;
             if (plist.TryGetValue("streams", out var streamsObj) && streamsObj is object[] arr && arr.Length > 0)
             {
@@ -433,47 +482,55 @@ namespace CloudCast.Services
             }
 
             long dataPort;
+            long controlPort;
 
-            if (streamType == 110) // video mirroring
+            if (streamType == 110) // screen mirroring
             {
                 if (_activeSession == null)
                 {
                     _activeSession = new MirroringSession(_player);
                     await _activeSession.BindUdpAsync();
                 }
-                dataPort = _activeSession.VideoPort;
+                dataPort    = _activeSession.VideoPort;
+                _videoControlSocket = await BindEphemeralUdpAsync(_videoControlSocket);
+                controlPort = long.Parse(_videoControlSocket.Information.LocalPort);
                 System.Diagnostics.Debug.WriteLine(
-                    $"[AirPlay] SETUP stream: type=110 (video) dataPort={dataPort}");
+                    $"[AirPlay] SETUP #2: type=110 (screen) dataPort={dataPort} controlPort={controlPort}");
             }
-            else // audio (type=96) or other — bind a dummy UDP socket
+            else // audio (type=96/103) or other — bind data + control sockets
             {
-                _audioSocket?.Dispose();
-                _audioSocket = new DatagramSocket();
-                await _audioSocket.BindServiceNameAsync("0");
-                dataPort = long.Parse(_audioSocket.Information.LocalPort);
+                _audioSocket        = await BindEphemeralUdpAsync(_audioSocket);
+                _audioControlSocket = await BindEphemeralUdpAsync(_audioControlSocket);
+                dataPort    = long.Parse(_audioSocket.Information.LocalPort);
+                controlPort = long.Parse(_audioControlSocket.Information.LocalPort);
                 System.Diagnostics.Debug.WriteLine(
-                    $"[AirPlay] SETUP stream: type={streamType} (audio) dataPort={dataPort}");
+                    $"[AirPlay] SETUP #2: type={streamType} (audio) dataPort={dataPort} controlPort={controlPort}");
             }
-
-            ushort timingPort = GetTimingPort();
-            System.Diagnostics.Debug.WriteLine(
-                $"[AirPlay] SETUP stream response: type={streamType} dataPort={dataPort} " +
-                $"eventPort={_eventPort} timingPort={timingPort}");
 
             var responseDict = new Dictionary<string, object>
             {
-                ["eventPort"]  = (long)_eventPort,
-                ["timingPort"] = (long)timingPort,
                 ["streams"] = new object[]
                 {
                     new Dictionary<string, object>
                     {
-                        ["type"]     = streamType,
-                        ["dataPort"] = dataPort,
+                        ["type"]        = streamType,
+                        ["dataPort"]    = dataPort,
+                        ["controlPort"] = controlPort,
                     }
                 }
             };
             return HttpResp.Ok(BinaryPlist.Encode(responseDict), "application/x-apple-binary-plist");
+        }
+
+        // Returns the given UDP socket if already bound, otherwise binds a fresh one
+        // to an OS-assigned ephemeral port. (Cannot use a ref parameter here because
+        // async methods disallow ref/out — callers assign the returned socket.)
+        private static async Task<DatagramSocket> BindEphemeralUdpAsync(DatagramSocket? existing)
+        {
+            if (existing != null) return existing;
+            var socket = new DatagramSocket();
+            await socket.BindServiceNameAsync("0");
+            return socket;
         }
 
         private async Task<HttpResp> HandleStreamAsync(HttpReq req)
@@ -558,6 +615,10 @@ namespace CloudCast.Services
             }
             _audioSocket?.Dispose();
             _audioSocket = null;
+            _videoControlSocket?.Dispose();
+            _videoControlSocket = null;
+            _audioControlSocket?.Dispose();
+            _audioControlSocket = null;
             _timingSocket?.Dispose();
             _timingSocket = null;
             _eventListener?.Dispose();

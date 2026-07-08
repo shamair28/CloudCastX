@@ -1,5 +1,11 @@
 # CloudCast — Handoff Document
-_Last updated: 2026-05-05_
+_Last updated: 2026-07-08_
+
+> **Note:** This is the original phase-planning document. The live, up-to-date
+> engineering status lives in `codex-changes.md` (testing branch). The FairPlay
+> stub, namespace, and manifest issues described below are resolved; the current
+> focus is the AirPlay 2 `SETUP` channel negotiation and PTP timing. See
+> `codex-changes.md` → "2026-07-08 — SETUP handshake corrected against the AirPlay 2 spec".
 
 ---
 
@@ -85,8 +91,8 @@ iPhone                        CloudCast
 | Phase | Description | Status |
 |---|---|---|
 | 1 | mDNS advertisement — device appears in AirPlay picker | ✅ Working |
-| 2 | HAP pairing handshake — device connects | 🔄 In progress — getting "Unable to connect" on phone |
-| 3 | Screen mirroring — H.264 video renders | ⬜ Blocked by FairPlay stub |
+| 2 | Pairing + fp-setup + SETUP handshake — device connects | 🔄 SETUP responses corrected to spec (2026-07-08); event/data/control channels negotiated. Verify on-device |
+| 3 | Screen mirroring — H.264 video renders | ⬜ Pending PTP clock responder (timing sync) |
 | 4 | RAOP audio streaming | ⬜ Not started |
 | 5 | Xbox polish (gamepad nav, suspend/resume) | ⬜ Not started |
 
@@ -94,26 +100,29 @@ iPhone                        CloudCast
 
 ## Active bug: "Unable to connect to CloudCast"
 
-The phone sees CloudCast in AirPlay (Phase 1 ✓) but fails when tapping it. Three things to check in order:
+_Root cause identified 2026-07-08 — see `codex-changes.md` for the full write-up._
 
-### Check 1 — Package.appxmanifest capability (most likely)
-The VS template generates a minimal manifest. The app **must** have `privateNetworkClientServer` or UWP silently blocks all inbound connections:
-```xml
-<Capabilities>
-  <Capability Name="internetClient" />
-  <Capability Name="privateNetworkClientServer" />
-</Capabilities>
-```
-In VS: right-click `Package.appxmanifest` → Open With → XML Editor and verify both lines are present.
+The phone saw CloudCast in the AirPlay picker (Phase 1 ✓) but failed when tapping
+it. The failure was in the RTSP **`SETUP`** exchange, not in pairing, firewall,
+namespaces, or the manifest — those earlier suspects are all resolved:
 
-### Check 2 — Windows Firewall
-Run once in elevated PowerShell:
-```powershell
-New-NetFirewallRule -DisplayName "CloudCast AirPlay" -Direction Inbound -Protocol TCP -LocalPort 7000 -Action Allow
-```
+- ✅ `Package.appxmanifest` already declares `internetClient` + `privateNetworkClientServer`.
+- ✅ Namespaces / `App.xaml.cs` navigation are correct (app starts, mDNS advertises, `/info` and pairing succeed).
 
-### Check 3 — Namespace mismatch
-All our `.cs` files use `namespace CloudCast.*`. The VS project is `CloudCastX`. If `App.xaml.cs` still has `typeof(CloudCast.Views.MainPage)` rather than the correct type, `AirPlayService` never starts. Check the `rootFrame.Navigate(typeof(...))` call in `App.xaml.cs` matches the actual namespace in `MainPage.xaml.cs`.
+The real problem: the two-part AirPlay 2 `SETUP` responses didn't match the spec.
+Most importantly, **SETUP #1 returned the control port (7000) as the event port**,
+so iOS opened its event channel into the RTSP server and — per the spec, *"the
+event channel must be open or the RTSP won't continue"* — the handshake stalled.
+Modern senders also use **PTP** timing, but the code always returned an NTP
+`timingPort`. Both are now fixed in `AirPlayControlServer.cs`.
+
+### If it still won't connect — check in order
+1. **Windows Firewall** — allow inbound on the control port once, in elevated PowerShell:
+   ```powershell
+   New-NetFirewallRule -DisplayName "CloudCast AirPlay" -Direction Inbound -Protocol TCP -LocalPort 7000 -Action Allow
+   ```
+2. **Watch the `[WIRE]` / `[AirPlay]` debug log** through both `SETUP` requests. SETUP #1 should log `eventPort=<ephemeral, not 7000> timingPort=0` (PTP) and SETUP #2 should log `dataPort` + `controlPort`. If SETUP #1 never arrives, the block is before SETUP (pairing/fp-setup).
+3. **PTP timing (known gap)** — if the handshake now completes but video never renders, the missing piece is the PTP clock responder (UDP 319/320). See `codex-changes.md` → "Remaining known gap".
 
 ---
 

@@ -76,8 +76,8 @@ iPhone                        CloudCast
 | `Services/MdnsAdvertiser.cs` | ✅ Complete | Advertises `_airplay._tcp` (port 7000) + `_raop._tcp` (port 5000) |
 | `Services/AirPlayControlServer.cs` | ✅ Complete | HTTP server on port 7000; routes `/info`, `/pair-setup`, `/pair-verify`, `/fp-setup`, `/stream`, `/stop` |
 | `Services/HapPairing.cs` | ✅ Complete | Full HAP pair-setup (SRP M1–M6) + pair-verify (M1–M4). **Caveat**: pair-verify M4 accepts without verifying the controller's LTPK (no persistence of paired controllers yet) |
-| `Services/FairPlaySetup.cs` | ❌ Stub | Returns HTTP 403. Blocks screen mirroring. See "What's missing" below |
-| `Services/MirroringSession.cs` | ✅ Complete | RTP receiver + RFC 6184 H.264 NALU parsing + `MediaStreamSource` pipeline. AES-CTR decryption not wired up (depends on FairPlay) |
+| `Services/FairPlaySetup.cs` | ✅ Complete | FairPlay 3 phase 1/2 exchange (SteeBono port); KeyMsg feeds OmgHax AES key decryption |
+| `Services/MirroringSession.cs` | ✅ Rewritten 2026-07-08 | TCP header-framed mirror receiver (128-byte headers, AES-CTR continuous keystream, AVCC→Annex B, avcC SPS/PPS) + `MediaStreamSource` pipeline. See `codex-changes.md` |
 | `Services/RaopServer.cs` | ⬜ Stub | Listens on port 5000, immediately closes connections. Phase 4 target |
 | `Util/BinaryPlist.cs` | ✅ Complete | Minimal binary plist encoder (dict, string, long, byte[], array) |
 | `Util/Tlv8.cs` | ✅ Complete | HAP TLV8 encoder/decoder |

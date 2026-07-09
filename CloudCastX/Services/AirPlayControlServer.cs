@@ -18,7 +18,6 @@ namespace CloudCast.Services
         private StreamSocketListener? _listener;
         private MirroringSession? _activeSession;
         private DatagramSocket? _audioSocket;
-        private DatagramSocket? _videoControlSocket;
         private DatagramSocket? _audioControlSocket;
         private DatagramSocket? _timingSocket;
         private StreamSocketListener? _eventListener;
@@ -143,7 +142,19 @@ namespace CloudCast.Services
             if (headers.TryGetValue("Content-Length", out string? clStr) &&
                 int.TryParse(clStr, out int cl) && cl > 0)
             {
-                await reader.LoadAsync((uint)cl);
+                // With InputStreamOptions.Partial a single LoadAsync may return
+                // fewer bytes than requested (body spanning TCP segments), and
+                // ReadBytes would then throw and kill the connection — loop
+                // until the full body is buffered.
+                while (reader.UnconsumedBufferLength < cl)
+                {
+                    uint loaded = await reader.LoadAsync((uint)cl - reader.UnconsumedBufferLength);
+                    if (loaded == 0)
+                    {
+                        System.Diagnostics.Debug.WriteLine("[AirPlay] Peer closed mid-body");
+                        return null;
+                    }
+                }
                 body = new byte[cl];
                 reader.ReadBytes(body);
             }
@@ -210,6 +221,7 @@ namespace CloudCast.Services
                     ("POST", "/stop")            => await HandleStop(),
                     ("RECORD", _)               => HandleRecord(req),
                     ("SETPEERS", _)             => HandleSetPeers(req),
+                    ("TEARDOWN", _)             => await HandleTeardownAsync(req),
                     _                            => await HandleSetupOrDefaultAsync(req),
                 };
             }
@@ -337,6 +349,27 @@ namespace CloudCast.Services
         private HttpResp HandleRecord(HttpReq req)
         {
             System.Diagnostics.Debug.WriteLine("[AirPlay] RECORD — streaming initiated");
+            var resp = HttpResp.Ok(Array.Empty<byte>());
+            resp.ExtraHeaders["Audio-Latency"] = "0";
+            return resp;
+        }
+
+        // TEARDOWN carries a plist body listing the streams being torn down;
+        // without an explicit route it fell through to the default handler and
+        // was misparsed as a SETUP #2, re-binding sockets mid-teardown.
+        private async Task<HttpResp> HandleTeardownAsync(HttpReq req)
+        {
+            System.Diagnostics.Debug.WriteLine("[AirPlay] TEARDOWN");
+            if (_activeSession != null)
+            {
+                await _activeSession.StopAsync();
+                _activeSession = null;
+            }
+            _audioSocket?.Dispose();
+            _audioSocket = null;
+            _audioControlSocket?.Dispose();
+            _audioControlSocket = null;
+            StreamingStopped?.Invoke();
             return HttpResp.Ok(Array.Empty<byte>());
         }
 
@@ -384,7 +417,7 @@ namespace CloudCast.Services
             }
             if (plist.TryGetValue("streamConnectionID", out var scid))
             {
-                _streamConnectionId = scid.ToString();
+                _streamConnectionId = FormatConnectionId(scid);
                 System.Diagnostics.Debug.WriteLine($"[AirPlay] SETUP: streamConnectionID={_streamConnectionId}");
             }
             if (plist.TryGetValue("timingPort", out var tpObj))
@@ -410,8 +443,13 @@ namespace CloudCast.Services
         // Ref: https://emanuelecozzi.net/docs/airplay2/rtsp/  (SETUP → 1) info and event)
         private async Task<HttpResp> HandleInitialSetupAsync(Dictionary<string, object> plist)
         {
-            // Modern senders (iOS 12+/macOS) negotiate PTP; only legacy senders use NTP.
-            string timingProtocol = "PTP";
+            // Our advertised features (SteeBono's 0x1E5A7FFFF7) do NOT include the
+            // PTP bit, so senders use NTP timing and typically omit the
+            // timingProtocol key entirely. An absent key therefore means NTP —
+            // defaulting to PTP here made us return timingPort=0 and never drive
+            // NTP, so the sender stalled waiting for timing sync. Only honour PTP
+            // when the sender explicitly asks for it.
+            string timingProtocol = "NTP";
             if (plist.TryGetValue("timingProtocol", out var tpProto) &&
                 tpProto is string proto && !string.IsNullOrEmpty(proto))
                 timingProtocol = proto;
@@ -478,49 +516,72 @@ namespace CloudCast.Services
                 {
                     if (firstStream.TryGetValue("type", out var typeObj))
                         streamType = Convert.ToInt64(typeObj);
+                    // streamConnectionID lives INSIDE the stream dict in SETUP #2;
+                    // it feeds the AES-CTR key derivation for the mirror stream.
+                    if (firstStream.TryGetValue("streamConnectionID", out var scid))
+                    {
+                        _streamConnectionId = FormatConnectionId(scid);
+                        System.Diagnostics.Debug.WriteLine(
+                            $"[AirPlay] SETUP #2: streamConnectionID={_streamConnectionId}");
+                    }
                 }
             }
 
-            long dataPort;
-            long controlPort;
+            Dictionary<string, object> streamResponse;
 
-            if (streamType == 110) // screen mirroring
+            if (streamType == 110) // screen mirroring — data arrives over TCP
             {
                 if (_activeSession == null)
                 {
                     _activeSession = new MirroringSession(_player);
-                    await _activeSession.BindUdpAsync();
+                    _activeSession.SenderConnected += () =>
+                        StreamingStarted?.Invoke("AirPlay device");
                 }
-                dataPort    = _activeSession.VideoPort;
-                _videoControlSocket = await BindEphemeralUdpAsync(_videoControlSocket);
-                controlPort = long.Parse(_videoControlSocket.Information.LocalPort);
+                await _activeSession.BindTcpAsync();
+                await _activeSession.ConfigureDecryptionAsync(
+                    _fp.KeyMsg, _encryptedAesKey, _hap.EcdhSharedSecret, _streamConnectionId);
+                await _activeSession.StartPlaybackAsync();
+                StatusChanged?.Invoke("Connecting…");
+
                 System.Diagnostics.Debug.WriteLine(
-                    $"[AirPlay] SETUP #2: type=110 (screen) dataPort={dataPort} controlPort={controlPort}");
+                    $"[AirPlay] SETUP #2: type=110 (screen) dataPort={_activeSession.VideoPort} (TCP)");
+
+                streamResponse = new Dictionary<string, object>
+                {
+                    ["type"]     = streamType,
+                    ["dataPort"] = (long)_activeSession.VideoPort,
+                };
             }
-            else // audio (type=96/103) or other — bind data + control sockets
+            else // audio (type=96/103) or other — UDP data + control sockets
             {
                 _audioSocket        = await BindEphemeralUdpAsync(_audioSocket);
                 _audioControlSocket = await BindEphemeralUdpAsync(_audioControlSocket);
-                dataPort    = long.Parse(_audioSocket.Information.LocalPort);
-                controlPort = long.Parse(_audioControlSocket.Information.LocalPort);
+                long dataPort    = long.Parse(_audioSocket.Information.LocalPort);
+                long controlPort = long.Parse(_audioControlSocket.Information.LocalPort);
                 System.Diagnostics.Debug.WriteLine(
                     $"[AirPlay] SETUP #2: type={streamType} (audio) dataPort={dataPort} controlPort={controlPort}");
+
+                streamResponse = new Dictionary<string, object>
+                {
+                    ["type"]        = streamType,
+                    ["dataPort"]    = dataPort,
+                    ["controlPort"] = controlPort,
+                };
             }
 
             var responseDict = new Dictionary<string, object>
             {
-                ["streams"] = new object[]
-                {
-                    new Dictionary<string, object>
-                    {
-                        ["type"]        = streamType,
-                        ["dataPort"]    = dataPort,
-                        ["controlPort"] = controlPort,
-                    }
-                }
+                ["streams"] = new object[] { streamResponse }
             };
             return HttpResp.Ok(BinaryPlist.Encode(responseDict), "application/x-apple-binary-plist");
         }
+
+        // Key derivation uses the UNSIGNED decimal form of streamConnectionID
+        // (a uint64). Our plist decoder returns 8-byte ints as signed longs, so
+        // IDs with the high bit set would otherwise render with a '-' and derive
+        // the wrong stream key (RPiPlay/UxPlay both format with %llu).
+        private static string FormatConnectionId(object value) =>
+            value is long l ? ((ulong)l).ToString() : value.ToString() ?? "";
 
         // Returns the given UDP socket if already bound, otherwise binds a fresh one
         // to an OS-assigned ephemeral port. (Cannot use a ref parameter here because
@@ -548,8 +609,8 @@ namespace CloudCast.Services
                     _encryptedAesKey = ekey;
                 if (plist.TryGetValue("eiv", out var eivObj) && eivObj is byte[] eiv)
                     _aesIv = eiv;
-                if (plist.TryGetValue("streamConnectionID", out var scid))
-                    _streamConnectionId = scid?.ToString();
+                if (plist.TryGetValue("streamConnectionID", out var scid) && scid != null)
+                    _streamConnectionId = FormatConnectionId(scid);
             }
 
             if (_fp.KeyMsg == null)
@@ -562,12 +623,13 @@ namespace CloudCast.Services
             if (_activeSession == null)
             {
                 _activeSession = new MirroringSession(_player);
-                await _activeSession.BindUdpAsync();
+                _activeSession.SenderConnected += () =>
+                    StreamingStarted?.Invoke("AirPlay device");
             }
-
-            await _activeSession.StartAsync(1920, 1080,
-                _fp.KeyMsg, _encryptedAesKey, _aesIv,
-                _hap.EcdhSharedSecret, _streamConnectionId);
+            await _activeSession.BindTcpAsync();
+            await _activeSession.ConfigureDecryptionAsync(
+                _fp.KeyMsg, _encryptedAesKey, _hap.EcdhSharedSecret, _streamConnectionId);
+            await _activeSession.StartPlaybackAsync();
 
             StatusChanged?.Invoke("Connecting…");
 
@@ -582,12 +644,6 @@ namespace CloudCast.Services
                     }
                 }
             };
-            _ = Task.Run(async () =>
-            {
-                await Task.Delay(500);
-                StreamingStarted?.Invoke("AirPlay device");
-            });
-
             return HttpResp.Ok(BinaryPlist.Encode(responseDict), "application/x-apple-binary-plist");
         }
 
@@ -615,8 +671,6 @@ namespace CloudCast.Services
             }
             _audioSocket?.Dispose();
             _audioSocket = null;
-            _videoControlSocket?.Dispose();
-            _videoControlSocket = null;
             _audioControlSocket?.Dispose();
             _audioControlSocket = null;
             _timingSocket?.Dispose();

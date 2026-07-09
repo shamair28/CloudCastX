@@ -2,8 +2,76 @@
 
 **Branch:** `testing`
 **Repo:** https://github.com/shamair28/CloudCastX
-**Last updated:** 2026-07-08
-**Status:** SETUP handshake reworked to match the authoritative AirPlay 2 RTSP contract. The event/timing/data/control channels are now negotiated the way modern (PTP) iOS senders expect. Full PTP clock sync is the remaining known gap for video actually rendering (see Outstanding Issues).
+**Last updated:** 2026-07-08 (second session)
+**Status:** Mirroring data path rewritten from UDP/RTP to the correct TCP header-framed protocol; timing negotiation defaults corrected to NTP (matching our advertised features); RTSP body-read truncation fixed. Build passes. Needs on-device verification.
+
+---
+
+## 2026-07-08 (later) — Mirror stream moved to TCP; timing + framing fixes
+
+The previous session fixed SETUP response *shapes* but three deeper bugs remained.
+This session's audit against SteeBono/airplayreceiver, RPiPlay, and UxPlay found
+and fixed them all (build verified, not yet tested on-device):
+
+### 1. Screen-mirroring data is TCP, not UDP/RTP — `MirroringSession.cs` rewritten
+`MirroringSession` bound a **UDP** socket and parsed **RTP (RFC 6184)**. But for
+stream type 110 the sender opens a **TCP connection** to `dataPort` and sends
+`[128-byte header][payload]` packets (header: payloadSize u32 LE @0, payloadType
+u16 LE @4, NTP timestamp u64 LE @8). That is how every working receiver
+(SteeBono, RPiPlay, UxPlay) implements it. Consequences of the old design: iOS's
+TCP connect to our UDP port was refused → the session aborted right after
+SETUP #2 ("Unable to connect"), and no video could ever have rendered.
+
+The rewrite implements:
+- TCP `StreamSocketListener` bound at SETUP #2; its port returned as `dataPort`.
+- Payload type 0: AES-128-CTR decrypt with a **byte-continuous keystream across
+  packets** (the old code reset the counter every packet), then AVCC→Annex B
+  conversion (4-byte BE NALU lengths → start codes).
+- Payload type 1: unencrypted avcC record; SPS/PPS extracted, converted to
+  Annex B, and prepended to the next video frame (marked as key frame).
+- PTS derived from the NTP timestamp in the packet header; monotonicity enforced.
+- Frame queue bounded at 120 frames (drop-oldest) so a stalled decoder can't
+  balloon memory.
+- Decryption is configured at SETUP #2 time (KeyMsg from fp-setup, ekey from
+  SETUP #1, ECDH secret from pair-verify, streamConnectionID from the stream
+  dict) instead of waiting for a `/stream` request that never comes in this flow.
+
+### 2. Absent `timingProtocol` means NTP, not PTP — `AirPlayControlServer.cs`
+Our advertised features (`0x1E5A7FFFF7`) do **not** include the PTP bit, so iOS
+uses legacy NTP timing and typically omits `timingProtocol` from SETUP #1. The
+code defaulted to PTP, returned `timingPort=0`, and never drove NTP — the sender
+stalled waiting for timing sync. Default is now NTP; PTP is honoured only when
+explicitly requested.
+
+### 3. RTSP request bodies could be silently truncated — `AirPlayControlServer.cs`
+`ReadRequestAsync` did a single `LoadAsync(contentLength)` with
+`InputStreamOptions.Partial`, which may return fewer bytes than requested when a
+body spans TCP segments; `ReadBytes` then threw and killed the connection.
+Intermittent "Unable to connect" depending on packet boundaries. Now loops until
+the full body is buffered.
+
+### Smaller fixes
+- `streamConnectionID` is now also read from *inside* the stream dict in
+  SETUP #2 (it is not top-level there), and formatted as an **unsigned** decimal
+  string for `AirPlayStreamKey`/`AirPlayStreamIV` derivation (our plist decoder
+  returns signed longs; RPiPlay/UxPlay format with `%llu`).
+- `TEARDOWN` now has an explicit handler. Its plist body (which contains a
+  `streams` key) previously fell through to the default handler and was
+  misparsed as a SETUP #2, re-binding sockets mid-teardown.
+- SETUP #2 response for type 110 now contains only `{type, dataPort}` (matching
+  UxPlay); the bogus UDP "video control" socket is gone. Audio streams still get
+  `{type, dataPort, controlPort}`.
+- `RECORD` response now includes `Audio-Latency: 0`.
+- `StreamingStarted` now fires when the sender actually opens the mirror data
+  connection instead of on a 500 ms timer.
+
+### How to verify on-device
+Watch the debug log for this sequence: pairing → fp-setup (2 phases) →
+SETUP #1 (`eventPort=<ephemeral> timingPort=<udp port>` for NTP) → SETUP #2
+(`type=110 dataPort=<tcp port>`) → RECORD → `[Mirroring] Sender connected` →
+`[Mirroring] Codec data: SPS/PPS updated` → video frames. If the sender
+connects but no frames decode, suspect the AES-CTR key derivation
+(`streamConnectionID` signedness) first.
 
 ---
 

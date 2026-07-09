@@ -218,7 +218,7 @@ namespace CloudCast.Services
                 System.Diagnostics.Debug.WriteLine($"[AirPlay] {req.Method} {req.Path}");
                 return (req.Method, req.Path) switch
                 {
-                    ("GET",  "/info")           => HandleInfo(),
+                    ("GET",  "/info")           => HandleInfo(req),
                     (_, "/pair-setup")           => await HandlePairSetupAsync(req),
                     (_, "/pair-verify")          => await HandlePairVerifyAsync(req),
                     ("POST", "/fp-setup")        => HandleFpSetup(req),
@@ -239,8 +239,41 @@ namespace CloudCast.Services
             }
         }
 
-        private HttpResp HandleInfo()
+        private HttpResp HandleInfo(HttpReq req)
         {
+            // iOS's first GET /info carries a plist body with a "qualifier"
+            // asking for the raw mDNS TXT record over unicast (txtAirPlay /
+            // txtRAOP). Per UxPlay's raop_handler_info, the response to that
+            // request must contain ONLY the requested TXT record(s) — the full
+            // device dict below is reserved for the body-less GET /info.
+            if (req.Body.Length > 0)
+            {
+                var qualifierDict = new Dictionary<string, object>();
+                try
+                {
+                    var q = BinaryPlist.Decode(req.Body);
+                    if (q != null && q.TryGetValue("qualifier", out var qObj) && qObj is object[] quals)
+                    {
+                        foreach (var item in quals)
+                        {
+                            if ("txtAirPlay".Equals(item as string, StringComparison.Ordinal))
+                                qualifierDict["txtAirPlay"] = MdnsAdvertiser.BuildTxtRecordBytes(
+                                    MdnsAdvertiser.GetAirPlayTxtPairs(_config));
+                            else if ("txtRAOP".Equals(item as string, StringComparison.Ordinal))
+                                qualifierDict["txtRAOP"] = MdnsAdvertiser.BuildTxtRecordBytes(
+                                    MdnsAdvertiser.GetRaopTxtPairs(_config));
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[AirPlay] /info qualifier parse failed: {ex.Message}");
+                }
+                System.Diagnostics.Debug.WriteLine(
+                    $"[AirPlay] /info qualifier response: [{string.Join(", ", qualifierDict.Keys)}]");
+                return HttpResp.Ok(BinaryPlist.Encode(qualifierDict), "application/x-apple-binary-plist");
+            }
+
             // pk must be raw bytes (binary plist DATA type 0x4x).
             // statusFlags=0x04 = transient pairing supported, no PIN needed.
             // This value is kept CONSTANT for the lifetime of the receiver. The

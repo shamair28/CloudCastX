@@ -7,6 +7,26 @@
 
 ---
 
+## 2026-07-08 (fifth session) — /info qualifier must return the raw TXT record
+
+eventPort=0 + Audio-Jack-Status did not change the abort point: iOS still
+closed right after the SETUP #1 response. With SETUP #1 now byte-equivalent to
+UxPlay's, the remaining divergence was found in `/info`: iOS's FIRST GET /info
+carries a plist body `{qualifier: ["txtAirPlay"]}` asking for the receiver's
+raw mDNS TXT record over unicast. UxPlay's `raop_handler_info` responds to that
+request with ONLY `{txtAirPlay: <raw TXT bytes>}` and returns the full device
+dict only for the body-less GET /info. We were sending the full device dict
+(with no txtAirPlay key) to the qualifier request.
+
+Changes:
+- `MdnsAdvertiser` now owns the TXT key/value pairs as a single source of truth
+  (`GetAirPlayTxtPairs` / `GetRaopTxtPairs`) used by both the mDNS registration
+  and the new `BuildTxtRecordBytes` DNS-wire-format encoder.
+- `HandleInfo` distinguishes the two request forms: body with qualifier →
+  respond with only the requested TXT record(s); no body → full device dict.
+
+---
+
 ## 2026-07-08 (fourth session) — eventPort must be 0 for NTP mirroring
 
 Retest with firewall rules in place failed identically: iOS closed the RTSP

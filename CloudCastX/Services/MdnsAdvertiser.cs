@@ -1,4 +1,7 @@
 using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
 using System.Threading.Tasks;
 using Windows.Networking.ServiceDiscovery.Dnssd;
 using Windows.Networking.Sockets;
@@ -18,13 +21,61 @@ namespace CloudCast.Services
             _config = config;
         }
 
+        // ── TXT records ───────────────────────────────────────────────────────
+        // Single source of truth for the TXT key/value pairs. Used both for the
+        // mDNS advertisement and for GET /info "qualifier" responses (iOS asks
+        // for the raw txtAirPlay record over unicast and the two must match).
+
+        private static string PkHex(AirPlayConfig config) =>
+            BitConverter.ToString(config.Ed25519PublicKey).Replace("-", "").ToLowerInvariant();
+
+        public static List<KeyValuePair<string, string>> GetAirPlayTxtPairs(AirPlayConfig config) =>
+            new List<KeyValuePair<string, string>>
+            {
+                new KeyValuePair<string, string>("deviceid", config.DeviceId),
+                new KeyValuePair<string, string>("features", AirPlayConfig.FeaturesHex),
+                // sf=0x4: transient pairing (matches statusFlags in /info).
+                new KeyValuePair<string, string>("flags",    "0x4"),
+                new KeyValuePair<string, string>("model",    AirPlayConfig.Model),
+                new KeyValuePair<string, string>("pk",       PkHex(config)),
+                new KeyValuePair<string, string>("pi",       config.PairingId),
+                new KeyValuePair<string, string>("srcvers",  AirPlayConfig.ServerVersion),
+                new KeyValuePair<string, string>("vv",       "2"),
+            };
+
+        public static List<KeyValuePair<string, string>> GetRaopTxtPairs(AirPlayConfig config) =>
+            new List<KeyValuePair<string, string>>
+            {
+                new KeyValuePair<string, string>("am", AirPlayConfig.Model),
+                new KeyValuePair<string, string>("et", "0,3,5"),
+                new KeyValuePair<string, string>("ft", AirPlayConfig.FeaturesHex),
+                new KeyValuePair<string, string>("md", "0,1,2"),
+                new KeyValuePair<string, string>("pk", PkHex(config)),
+                new KeyValuePair<string, string>("sf", "0x4"),
+                new KeyValuePair<string, string>("tp", "UDP"),
+                new KeyValuePair<string, string>("vn", "65537"),
+                new KeyValuePair<string, string>("vs", AirPlayConfig.ServerVersion),
+            };
+
+        // DNS TXT wire format: each entry is one length byte + "key=value".
+        public static byte[] BuildTxtRecordBytes(IEnumerable<KeyValuePair<string, string>> pairs)
+        {
+            using var ms = new MemoryStream();
+            foreach (var kv in pairs)
+            {
+                var entry = Encoding.UTF8.GetBytes($"{kv.Key}={kv.Value}");
+                ms.WriteByte((byte)entry.Length);
+                ms.Write(entry, 0, entry.Length);
+            }
+            return ms.ToArray();
+        }
+
         public async Task StartAsync()
         {
             System.Diagnostics.Debug.WriteLine(
                 $"[mDNS] Registering '{_config.DeviceName}' on port {AirPlayConfig.ControlPort}");
 
-            string pkHex = BitConverter.ToString(_config.Ed25519PublicKey)
-                               .Replace("-", "").ToLowerInvariant();
+            string pkHex = PkHex(_config);
 
             // ── _airplay._tcp ─────────────────────────────────────────────────
             _airplayInstance = new DnssdServiceInstance(
@@ -33,17 +84,8 @@ namespace CloudCast.Services
                 (ushort)AirPlayConfig.ControlPort);
 
             var airplayTxt = _airplayInstance.TextAttributes;
-            airplayTxt["deviceid"] = _config.DeviceId;
-            airplayTxt["features"] = AirPlayConfig.FeaturesHex;
-            // sf=0x4: transient pairing (matches statusFlags in /info).
-            // sf=0x0 would mean already-paired; sf=0x4 is the correct value
-            // for a receiver that supports transient pairing without a PIN.
-            airplayTxt["flags"]    = "0x4";
-            airplayTxt["model"]    = AirPlayConfig.Model;
-            airplayTxt["pk"]       = pkHex;
-            airplayTxt["pi"]       = _config.PairingId;
-            airplayTxt["srcvers"]  = AirPlayConfig.ServerVersion;
-            airplayTxt["vv"]       = "2";
+            foreach (var kv in GetAirPlayTxtPairs(_config))
+                airplayTxt[kv.Key] = kv.Value;
 
             System.Diagnostics.Debug.WriteLine(
                 $"[mDNS] _airplay._tcp: features={AirPlayConfig.FeaturesHex} sf=0x4 pk={pkHex.Substring(0, 8)}…");
@@ -62,16 +104,8 @@ namespace CloudCast.Services
                 (ushort)AirPlayConfig.ControlPort);
 
             var raopTxt = _raopInstance.TextAttributes;
-            raopTxt["am"] = AirPlayConfig.Model;
-            raopTxt["et"] = "0,3,5";
-            raopTxt["ft"] = AirPlayConfig.FeaturesHex;
-            raopTxt["md"] = "0,1,2";
-            raopTxt["pk"] = pkHex;
-            // sf=0x4 must match _airplay._tcp flags above
-            raopTxt["sf"] = "0x4";
-            raopTxt["tp"] = "UDP";
-            raopTxt["vn"] = "65537";
-            raopTxt["vs"] = AirPlayConfig.ServerVersion;
+            foreach (var kv in GetRaopTxtPairs(_config))
+                raopTxt[kv.Key] = kv.Value;
 
             System.Diagnostics.Debug.WriteLine(
                 $"[mDNS] _raop._tcp: {macNc}@{_config.DeviceName} sf=0x4");

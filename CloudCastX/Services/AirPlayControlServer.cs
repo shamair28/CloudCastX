@@ -444,6 +444,21 @@ namespace CloudCast.Services
             System.Diagnostics.Debug.WriteLine(
                 $"[AirPlay] SETUP plist keys: {string.Join(", ", plist.Keys)}");
 
+            // Full decoded dump — the timingProtocol/et/flags values decide which
+            // flow the sender expects and are the one thing we currently infer
+            // rather than read. Log scalar values (skip large byte blobs).
+            foreach (var kv in plist)
+            {
+                string shown = kv.Value switch
+                {
+                    byte[] b   => $"<{b.Length} bytes>",
+                    object[] a => $"<array[{a.Length}]>",
+                    Dictionary<string, object> d => $"<dict{{{string.Join(",", d.Keys)}}}>",
+                    _          => kv.Value?.ToString() ?? "null",
+                };
+                System.Diagnostics.Debug.WriteLine($"[AirPlay] SETUP   {kv.Key} = {shown}");
+            }
+
             // Extract crypto keys whenever present (may arrive in initial or stream SETUP)
             if (plist.TryGetValue("ekey", out var ekeyObj) && ekeyObj is byte[] ekey)
             {

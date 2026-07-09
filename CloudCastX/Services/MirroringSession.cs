@@ -73,7 +73,19 @@ namespace CloudCast.Services
             if (_listener != null) return;
             _listener = new StreamSocketListener();
             _listener.ConnectionReceived += OnMirrorConnection;
-            await _listener.BindServiceNameAsync("0"); // OS-assigned ephemeral port
+            try
+            {
+                await _listener.BindServiceNameAsync(AirPlayConfig.MirrorDataPort.ToString());
+            }
+            catch
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"[Mirroring] Port {AirPlayConfig.MirrorDataPort} unavailable — falling back to ephemeral");
+                _listener.Dispose();
+                _listener = new StreamSocketListener();
+                _listener.ConnectionReceived += OnMirrorConnection;
+                await _listener.BindServiceNameAsync("0");
+            }
             VideoPort = ushort.Parse(_listener.Information.LocalPort);
             System.Diagnostics.Debug.WriteLine($"[Mirroring] TCP listener bound on port {VideoPort}");
         }

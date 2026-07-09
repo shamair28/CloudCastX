@@ -7,6 +7,32 @@
 
 ---
 
+## 2026-07-08 (third session) — Fixed service ports; firewall is the current blocker
+
+On-device test after the TCP rewrite got much further: pairing, fp-setup, and
+SETUP #1 all succeeded and the NTP timing exchange worked (sender replied to our
+timing request). iOS then closed the RTSP connection without ever opening its
+event connection — the receiver had advertised an ephemeral event port (6535),
+and the only firewall rule on the machine allows inbound TCP 7000. Outbound-
+initiated traffic (NTP) got through; inbound-initiated (event TCP) was dropped,
+and per the spec iOS will not continue past SETUP #1 without the event channel.
+
+Changes:
+- All service sockets now bind FIXED ports (falling back to OS-assigned if
+  taken): event **7001/TCP**, timing **7002/UDP**, mirror data **7100/TCP**,
+  audio data **6000/UDP**, audio control **6001/UDP** (`AirPlayConfig` consts).
+  Fixed ports also keep us out of the Xbox-blocked 57344+ ephemeral range.
+- SETUP #1 now logs a WARNING if no event connection arrives within 3 s,
+  pointing at the firewall.
+
+**Required one-time setup (elevated PowerShell):**
+```powershell
+New-NetFirewallRule -DisplayName "CloudCast AirPlay TCP" -Direction Inbound -Protocol TCP -LocalPort 5000,7000,7001,7100 -Action Allow
+New-NetFirewallRule -DisplayName "CloudCast AirPlay UDP" -Direction Inbound -Protocol UDP -LocalPort 6000,6001,7002 -Action Allow
+```
+
+---
+
 ## 2026-07-08 (later) — Mirror stream moved to TCP; timing + framing fixes
 
 The previous session fixed SETUP response *shapes* but three deeper bugs remained.

@@ -14,8 +14,19 @@ namespace CloudCast.Services
         public const string Model         = "AppleTV5,3";
         public const string ServerVersion = "220.68";
 
-        public const ushort ControlPort = 7000;  // also used as timingPort + eventPort in SETUP responses
+        public const ushort ControlPort = 7000;
         public const ushort RaopPort    = 5000;
+
+        // Fixed service ports (SteeBono-style). Fixed rather than OS-assigned so
+        // a one-time firewall rule can cover them — iOS aborts after SETUP #1 if
+        // its inbound event connection is dropped — and so we stay clear of the
+        // Xbox-blocked 57344+ range that Windows uses for ephemeral ports.
+        // Binds fall back to an OS-assigned port if the fixed one is taken.
+        public const ushort EventPort        = 7001;
+        public const ushort TimingPort       = 7002;
+        public const ushort MirrorDataPort   = 7100;
+        public const ushort AudioDataPort    = 6000;
+        public const ushort AudioControlPort = 6001;
 
         // Features bitmask — SteeBono's known-working values from airplayreceiver
         // (https://github.com/SteeBono/airplayreceiver, MIT License).

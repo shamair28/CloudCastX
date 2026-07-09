@@ -22,6 +22,7 @@ namespace CloudCast.Services
         private DatagramSocket? _timingSocket;
         private StreamSocketListener? _eventListener;
         private ushort _eventPort;
+        private bool _eventConnected;
 
         private byte[]? _encryptedAesKey;
         private byte[]? _aesIv;
@@ -495,6 +496,20 @@ namespace CloudCast.Services
                 };
             }
 
+            // The RTSP flow will not continue until the sender opens its event
+            // connection. If it never arrives, the usual culprit is Windows
+            // Firewall dropping inbound connections on the event port — surface
+            // that in the log instead of failing silently.
+            _eventConnected = false;
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(3000);
+                if (!_eventConnected)
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[AirPlay] WARNING: no event connection on port {_eventPort} within 3s — " +
+                        "check Windows Firewall inbound rules for this port");
+            });
+
             return HttpResp.Ok(BinaryPlist.Encode(responseDict), "application/x-apple-binary-plist");
         }
 
@@ -554,8 +569,8 @@ namespace CloudCast.Services
             }
             else // audio (type=96/103) or other — UDP data + control sockets
             {
-                _audioSocket        = await BindEphemeralUdpAsync(_audioSocket);
-                _audioControlSocket = await BindEphemeralUdpAsync(_audioControlSocket);
+                _audioSocket        = await BindUdpAsync(_audioSocket, AirPlayConfig.AudioDataPort);
+                _audioControlSocket = await BindUdpAsync(_audioControlSocket, AirPlayConfig.AudioControlPort);
                 long dataPort    = long.Parse(_audioSocket.Information.LocalPort);
                 long controlPort = long.Parse(_audioControlSocket.Information.LocalPort);
                 System.Diagnostics.Debug.WriteLine(
@@ -583,14 +598,26 @@ namespace CloudCast.Services
         private static string FormatConnectionId(object value) =>
             value is long l ? ((ulong)l).ToString() : value.ToString() ?? "";
 
-        // Returns the given UDP socket if already bound, otherwise binds a fresh one
-        // to an OS-assigned ephemeral port. (Cannot use a ref parameter here because
-        // async methods disallow ref/out — callers assign the returned socket.)
-        private static async Task<DatagramSocket> BindEphemeralUdpAsync(DatagramSocket? existing)
+        // Returns the given UDP socket if already bound, otherwise binds a fresh
+        // one to the preferred fixed port, falling back to an OS-assigned port.
+        // (Cannot use a ref parameter here because async methods disallow
+        // ref/out — callers assign the returned socket.)
+        private static async Task<DatagramSocket> BindUdpAsync(DatagramSocket? existing, ushort preferredPort)
         {
             if (existing != null) return existing;
             var socket = new DatagramSocket();
-            await socket.BindServiceNameAsync("0");
+            try
+            {
+                await socket.BindServiceNameAsync(preferredPort.ToString());
+            }
+            catch
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"[AirPlay] UDP port {preferredPort} unavailable — falling back to ephemeral");
+                socket.Dispose();
+                socket = new DatagramSocket();
+                await socket.BindServiceNameAsync("0");
+            }
             return socket;
         }
 
@@ -688,7 +715,19 @@ namespace CloudCast.Services
             if (_eventListener != null) return;
             _eventListener = new StreamSocketListener();
             _eventListener.ConnectionReceived += OnEventConnectionReceived;
-            await _eventListener.BindServiceNameAsync("0");
+            try
+            {
+                await _eventListener.BindServiceNameAsync(AirPlayConfig.EventPort.ToString());
+            }
+            catch
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"[AirPlay] Event port {AirPlayConfig.EventPort} unavailable — falling back to ephemeral");
+                _eventListener.Dispose();
+                _eventListener = new StreamSocketListener();
+                _eventListener.ConnectionReceived += OnEventConnectionReceived;
+                await _eventListener.BindServiceNameAsync("0");
+            }
             _eventPort = ushort.Parse(_eventListener.Information.LocalPort);
             System.Diagnostics.Debug.WriteLine($"[AirPlay] Event TCP listener bound on port {_eventPort}");
         }
@@ -696,6 +735,7 @@ namespace CloudCast.Services
         private async void OnEventConnectionReceived(StreamSocketListener sender,
             StreamSocketListenerConnectionReceivedEventArgs args)
         {
+            _eventConnected = true;
             System.Diagnostics.Debug.WriteLine(
                 $"[AirPlay] Event connection from {args.Socket.Information.RemoteAddress.DisplayName}");
             // Keep the connection alive — iOS uses this for event delivery
@@ -722,7 +762,19 @@ namespace CloudCast.Services
             if (_timingSocket != null) return;
             _timingSocket = new DatagramSocket();
             _timingSocket.MessageReceived += OnTimingMessage;
-            await _timingSocket.BindServiceNameAsync("0");
+            try
+            {
+                await _timingSocket.BindServiceNameAsync(AirPlayConfig.TimingPort.ToString());
+            }
+            catch
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"[AirPlay] Timing port {AirPlayConfig.TimingPort} unavailable — falling back to ephemeral");
+                _timingSocket.Dispose();
+                _timingSocket = new DatagramSocket();
+                _timingSocket.MessageReceived += OnTimingMessage;
+                await _timingSocket.BindServiceNameAsync("0");
+            }
             System.Diagnostics.Debug.WriteLine(
                 $"[AirPlay] Timing socket bound on port {_timingSocket.Information.LocalPort}");
         }

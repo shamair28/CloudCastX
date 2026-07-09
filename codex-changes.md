@@ -7,6 +7,38 @@
 
 ---
 
+## 2026-07-08 (sixth session) — Fresh receiver identity (suspected stale sender cache)
+
+The txtAirPlay qualifier fix was confirmed working in the wire log, but iOS
+still closed at exactly the same point (after SETUP #1 + one NTP exchange).
+Three different SETUP #1 response variants have now produced an identical
+abort, which points away from response content and toward sender-side state.
+Telling detail: the phone NEVER sends POST /pair-setup — with our feature bits
+a first-contact client should pair-setup before pair-verify. It is skipping it
+because it has CACHED state for this receiver identity, which has been constant
+(persisted in LocalSettings) across weeks of incompatible protocol iterations —
+including an era when pair-setup was a completely different HAP/TLV8
+implementation.
+
+Changes:
+- `AirPlayConfig.IdentityVersion` (now 2): bumping it regenerates the full
+  receiver identity — MAC/deviceID, Ed25519 pair, pairing ID — and the device
+  name is now derived from the MAC (`CloudCast-XXXXXX`) so the phone sees a
+  brand-new device in the picker.
+- NTP transmit timestamps now carry full sub-second precision (was
+  millisecond-truncated via `DateTimeOffset.Millisecond`).
+
+Test notes: reboot the iPhone (or toggle Wi-Fi) before testing to flush its
+AirPlay discovery cache. Expect the picker to show `CloudCast-XXXXXX`. Watch
+whether the phone now sends POST /pair-setup before pair-verify — if it does,
+the stale-cache theory is confirmed.
+
+If the abort STILL reproduces identically with a fresh identity, next step is
+empirical: build/run UxPlay on this PC (MSYS2) and diff its wire exchange with
+the same phone against ours, request by request.
+
+---
+
 ## 2026-07-08 (fifth session) — /info qualifier must return the raw TXT record
 
 eventPort=0 + Audio-Jack-Status did not change the abort point: iOS still

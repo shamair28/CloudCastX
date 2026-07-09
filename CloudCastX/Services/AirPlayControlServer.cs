@@ -899,9 +899,10 @@ namespace CloudCast.Services
                 packet[2] = 0x00;
                 packet[3] = 0x07;
 
-                long unixSec = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-                long ntpSec  = unixSec + 2208988800L; // NTP epoch offset
-                long frac    = (long)((DateTimeOffset.UtcNow.Millisecond / 1000.0) * 0x100000000L);
+                var now = DateTimeOffset.UtcNow;
+                long ntpSec = now.ToUnixTimeSeconds() + 2208988800L; // NTP epoch offset
+                double subSec = (now.UtcTicks % TimeSpan.TicksPerSecond) / (double)TimeSpan.TicksPerSecond;
+                long frac = (long)(subSec * 4294967296.0);
 
                 packet[24] = (byte)(ntpSec >> 24);
                 packet[25] = (byte)(ntpSec >> 16);

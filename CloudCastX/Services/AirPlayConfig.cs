@@ -39,7 +39,15 @@ namespace CloudCast.Services
 
         // ── Instance identity ──────────────────────────────────────────────────
 
-        public string DeviceName    { get; private set; } = "CloudCastXTest";
+        // Bump to force a brand-new receiver identity (new MAC, Ed25519 pair,
+        // pairing ID, name). iOS caches receiver state keyed by deviceid/pk/pi;
+        // the identity had been kept constant across weeks of protocol rework
+        // (including an incompatible earlier pair-setup implementation), so a
+        // stale cache entry on the sender can poison an otherwise-correct
+        // handshake. A fresh identity makes the phone treat us as a new device.
+        private const int IdentityVersion = 2;
+
+        public string DeviceName    { get; private set; } = string.Empty;
         public string DeviceId      { get; private set; } = string.Empty;
         public string PairingId     { get; private set; } = string.Empty;
 
@@ -53,27 +61,36 @@ namespace CloudCast.Services
             var s = ApplicationData.Current.LocalSettings;
             var cfg = new AirPlayConfig();
 
-            cfg.DeviceId  = s.Values["DeviceId"]  as string ?? GenerateMac();
-            cfg.PairingId = s.Values["PairingId"] as string ?? Guid.NewGuid().ToString("D");
-
+            int storedVersion = s.Values["IdentityVersion"] is int v ? v : 0;
             var pubB64  = s.Values["Ed25519Pub"]  as string;
             var privB64 = s.Values["Ed25519Priv"] as string;
 
-            if (pubB64 == null || privB64 == null)
+            if (storedVersion != IdentityVersion || pubB64 == null || privB64 == null)
             {
+                cfg.DeviceId  = GenerateMac();
+                cfg.PairingId = Guid.NewGuid().ToString("D");
                 var (pub, priv) = GenerateEd25519();
                 cfg.Ed25519PublicKey  = pub;
                 cfg.Ed25519PrivateKey = priv;
+                s.Values["IdentityVersion"] = IdentityVersion;
                 s.Values["DeviceId"]    = cfg.DeviceId;
                 s.Values["PairingId"]   = cfg.PairingId;
                 s.Values["Ed25519Pub"]  = Convert.ToBase64String(pub);
                 s.Values["Ed25519Priv"] = Convert.ToBase64String(priv);
+                System.Diagnostics.Debug.WriteLine(
+                    $"[Config] Generated fresh receiver identity v{IdentityVersion} ({cfg.DeviceId})");
             }
             else
             {
+                cfg.DeviceId  = s.Values["DeviceId"]  as string ?? GenerateMac();
+                cfg.PairingId = s.Values["PairingId"] as string ?? Guid.NewGuid().ToString("D");
                 cfg.Ed25519PublicKey  = Convert.FromBase64String(pubB64);
                 cfg.Ed25519PrivateKey = Convert.FromBase64String(privB64);
             }
+
+            // Derive the visible name from the MAC so a fresh identity is also a
+            // "new" device in the AirPlay picker (iOS caches by name too).
+            cfg.DeviceName = $"CloudCast-{cfg.DeviceId.Replace(":", "").Substring(8)}";
 
             return cfg;
         }

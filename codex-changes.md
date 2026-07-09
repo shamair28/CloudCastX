@@ -7,6 +7,34 @@
 
 ---
 
+## 2026-07-08 (fourth session) — eventPort must be 0 for NTP mirroring
+
+Retest with firewall rules in place failed identically: iOS closed the RTSP
+connection immediately after the SETUP #1 response and never attempted an event
+connection — so the firewall was NOT the blocker. Checked the actual UxPlay
+source (`lib/raop_handlers.h`, actively maintained against iOS 17/18): **the
+event channel is not used at all in NTP mirror/audio mode**. UxPlay returns
+`eventPort=0`, binds no event listener, and iOS proceeds straight to SETUP #2.
+The "event channel must be open or RTSP won't continue" rule from the
+emanuelecozzi docs applies to the modern PTP/HAP flow only. Our real, unused
+event port (7001) was a deviation from every working receiver in the exact
+response iOS aborted on.
+
+Changes (aligning byte-for-byte with UxPlay's behavior):
+- SETUP #1 (NTP): return `eventPort=0`, bind no event listener. The dedicated
+  event listener + firewall warning now exist only in the PTP branch.
+- Every RTSP response except RECORD now includes
+  `Audio-Jack-Status: connected; type=digital` (UxPlay does this).
+- NTP polling now continues every 3 s for the life of the timing socket
+  (was: stopped after ~25 s).
+
+Also confirmed from UxPlay source while there: our mirror-stream key derivation
+matches theirs — aeskey = SHA-512(fairplay-decrypted-key ‖ ecdh-secret)[0..16],
+stream key/IV = SHA-512("AirPlayStreamKey"/"AirPlayStreamIV" + unsigned-connID ‖
+aeskey)[0..16] — so the decryption path should be sound once SETUP #2 happens.
+
+---
+
 ## 2026-07-08 (third session) — Fixed service ports; firewall is the current blocker
 
 On-device test after the TCP rewrite got much further: pairing, fp-setup, and

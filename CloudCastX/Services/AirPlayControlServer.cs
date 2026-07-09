@@ -179,7 +179,13 @@ namespace CloudCast.Services
             sb.Append($"Server: AirTunes/{AirPlayConfig.ServerVersion}\r\n");
             // Echo CSeq — mandatory in RTSP, harmless in HTTP
             if (req.Headers.TryGetValue("CSeq", out var cseq))
+            {
                 sb.Append($"CSeq: {cseq}\r\n");
+                // UxPlay adds this to every RTSP response except RECORD; some
+                // senders expect it on legacy (NTP) sessions.
+                if (!req.Method.Equals("RECORD", StringComparison.OrdinalIgnoreCase))
+                    sb.Append("Audio-Jack-Status: connected; type=digital\r\n");
+            }
             sb.Append($"Content-Length: {resp.Body.Length}\r\n");
             if (!string.IsNullOrEmpty(resp.ContentType))
                 sb.Append($"Content-Type: {resp.ContentType}\r\n");
@@ -457,32 +463,49 @@ namespace CloudCast.Services
 
             bool useNtp = timingProtocol.Equals("NTP", StringComparison.OrdinalIgnoreCase);
 
-            // The event channel MUST be a dedicated TCP listener on its own port.
-            // Previously this returned the control port (7000), so iOS opened its
-            // event connection straight into the RTSP server and the handshake stalled.
-            await EnsureEventSocketAsync();
-
             long timingPort;
+            long eventPort;
             if (useNtp)
             {
+                // The event channel is NOT used in NTP mirror/audio mode — UxPlay
+                // (known-working with current iOS) returns eventPort=0 and never
+                // binds an event listener ("the event port is not used in mirror
+                // mode or audio mode", raop_handlers.h). Returning a real port
+                // here made iOS abort right after the SETUP #1 response.
+                eventPort = 0;
                 await EnsureTimingSocketAsync();
                 timingPort = GetTimingPort();
                 _ = StartNtpTimingAsync(); // legacy senders expect us to drive NTP
                 System.Diagnostics.Debug.WriteLine(
-                    $"[AirPlay] SETUP #1 (NTP): eventPort={_eventPort} timingPort={timingPort}");
+                    $"[AirPlay] SETUP #1 (NTP): eventPort=0 timingPort={timingPort}");
             }
             else
             {
-                // PTP: the receiver declares PTP by returning timingPort=0. Timing
-                // sync then happens out-of-band over PTP; no UDP timing socket is used.
+                // PTP (modern AirPlay 2 flow): a dedicated event TCP channel is
+                // required and the receiver declares PTP by returning timingPort=0.
+                await EnsureEventSocketAsync();
+                eventPort  = _eventPort;
                 timingPort = 0;
                 System.Diagnostics.Debug.WriteLine(
                     $"[AirPlay] SETUP #1 (PTP): eventPort={_eventPort} timingPort=0");
+
+                // In the PTP flow the RTSP handshake will not continue until the
+                // sender opens its event connection; surface a firewall hint if
+                // it never arrives.
+                _eventConnected = false;
+                _ = Task.Run(async () =>
+                {
+                    await Task.Delay(3000);
+                    if (!_eventConnected)
+                        System.Diagnostics.Debug.WriteLine(
+                            $"[AirPlay] WARNING: no event connection on port {_eventPort} within 3s — " +
+                            "check Windows Firewall inbound rules for this port");
+                });
             }
 
             var responseDict = new Dictionary<string, object>
             {
-                ["eventPort"]  = (long)_eventPort,
+                ["eventPort"]  = eventPort,
                 ["timingPort"] = timingPort,
             };
 
@@ -495,20 +518,6 @@ namespace CloudCast.Services
                     ["ID"]        = _localAddress!,
                 };
             }
-
-            // The RTSP flow will not continue until the sender opens its event
-            // connection. If it never arrives, the usual culprit is Windows
-            // Firewall dropping inbound connections on the event port — surface
-            // that in the log instead of failing silently.
-            _eventConnected = false;
-            _ = Task.Run(async () =>
-            {
-                await Task.Delay(3000);
-                if (!_eventConnected)
-                    System.Diagnostics.Debug.WriteLine(
-                        $"[AirPlay] WARNING: no event connection on port {_eventPort} within 3s — " +
-                        "check Windows Firewall inbound rules for this port");
-            });
 
             return HttpResp.Ok(BinaryPlist.Encode(responseDict), "application/x-apple-binary-plist");
         }
@@ -809,7 +818,8 @@ namespace CloudCast.Services
                 System.Diagnostics.Debug.WriteLine(
                     $"[NTP] Starting timing to {_clientAddress}:{_clientTimingPort}");
 
-                // Send a burst of 3 initial packets, then continue periodically
+                // Send a burst of 3 initial packets, then poll every 3 s like
+                // UxPlay for as long as the timing socket lives.
                 for (int i = 0; i < 3; i++)
                 {
                     await SendNtpPacketAsync();
@@ -820,9 +830,9 @@ namespace CloudCast.Services
                 {
                     try
                     {
-                        for (int i = 0; i < 50; i++)
+                        while (_timingSocket != null)
                         {
-                            await Task.Delay(500);
+                            await Task.Delay(3000);
                             await SendNtpPacketAsync();
                         }
                     }
